@@ -1,6 +1,10 @@
 # 办公自动化工具箱 (Office Toolbox JS)
 
-这是一个纯前端实现的办公自动化工具箱，旨在提高 CAD 图纸处理与 Excel 数据处理的效率。本项目无需后台服务器，所有数据处理均在浏览器本地完成，安全高效。
+这是一个办公自动化工具箱项目，包含：
+
+- 纯前端网页工具箱（本仓库根目录）。
+- WPF 桌面版 `DWG办公工具箱`（Windows 10+，MSIX 打包）。
+- WPF Win7 兼容版 `DWG办公工具箱_win7兼容`（.NET Framework 4.8，EXE 安装包）。
 
 ## 🛠️ 技术方案
 
@@ -42,6 +46,17 @@
 1.  下载本项目所有文件到本地目录。
 2.  直接使用 Chrome / Edge 浏览器打开 `index.html` 即可使用。
 3.  (推荐) 使用 VS Code 的 "Live Server" 插件运行，体验更佳。
+
+### WPF 桌面版（Windows 10+）
+- 目录：`DWG办公工具箱`
+- MSIX：`DWG办公工具箱\msix\DwgOfficeToolbox.msix`
+- 证书：`DWG办公工具箱\msix\cert\DwgOfficeToolbox.pfx`（需导入“受信任的人”）
+
+### WPF Win7 兼容版（.NET Framework 4.8）
+- 目录：`DWG办公工具箱_win7兼容`
+- 构建脚本：`DWG办公工具箱_win7兼容\build-exe-win7.ps1`
+- EXE 安装包：`DWG办公工具箱_win7兼容\dist\setup\DwgOfficeToolbox_Win7_Setup.exe`
+- Win7 机器需预装 **.NET Framework 4.8**
 
 ### 开发与扩展
 -   **添加新工具**: 在 `index.html` 添加 Tab 按钮及 Content 区域，新建 `.js` 文件并在底部引入。
