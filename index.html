@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>办公自动化工具箱</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="animations.css">
+  <meta name="theme-color" content="#2196F3">
+  <style>
+    .tool-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    .tool-btn-select {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 10px;
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all 0.2s;
+      text-align: center;
+      user-select: none;
+    }
+
+    .tool-btn-select:hover {
+      border-color: var(--primary-color);
+      transform: translateY(-2px);
+      box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+    }
+
+    .tool-btn-select.active {
+      background: var(--primary-color);
+      color: white;
+      border-color: var(--primary-color);
+    }
+
+    .tool-btn-select .icon {
+      font-size: 20px;
+      margin-bottom: 5px;
+    }
+
+    .tool-btn-select .name {
+      font-size: 12px;
+      line-height: 1.3;
+    }
+
+    .modal-close-btn {
+      border: none;
+      background: transparent;
+      font-size: 28px;
+      line-height: 1;
+      cursor: pointer;
+      color: var(--text-primary, #555);
+      opacity: 0.6;
+      transition: all 0.2s;
+      width: 32px;
+      height: 32px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 4px;
+    }
+
+    .modal-close-btn:hover {
+      opacity: 1;
+      background-color: rgba(0, 0, 0, 0.05);
+      /* Light gray hover */
+    }
+  </style>
+</head>
+
+<body data-theme="light">
+  <header>
+    <div class="container">
+      <div class="header-content">
+        <h1>办公自动化工具箱</h1>
+        <div class="settings">
+          <label>主题模式：</label>
+          <select id="bgColorSelector">
+            <option value="light">🌞 浅色模式</option>
+            <option value="dark">🌙 深色模式</option>
+            <option value="auto">🔄 自动切换</option>
+          </select>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <nav>
+    <div class="container">
+      <div class="tab-container">
+        <button class="tab-btn active" data-tab="dwg">📐 DWG 工具</button>
+        <button class="tab-btn" data-tab="excel">📊 Excel 工具</button>
+        <button class="tab-btn" data-tab="word">📝 Word 工具</button>
+      </div>
+    </div>
+  </nav>
+
+  <main>
+    <div class="container">
+      <!-- DWG 工具集合 -->
+      <section id="dwg" class="tab-content active">
+        <div class="tool-card">
+          <h2>📐 DWG 工具集</h2>
+          <div class="subtools">
+            <button class="subtab-btn active" data-sub="dxfSearch">🔍 DXF 关键字查找</button>
+            <button class="subtab-btn" data-sub="dxfValve">🔍 DXF 阀门风口信息统计</button>
+            <button class="subtab-btn" data-sub="dxfReplace">🔄 DWG 图纸文字内容替换</button>
+          </div>
+
+          <div id="dxfSearch" class="subtab-content active">
+            <h3>🔍 DXF 关键字查找</h3>
+            <div id="dropZone">📁 将 DXF 文件拖拽到此处或点击选择文件</div>
+            <input type="file" id="fileInput" multiple accept=".dxf" webkitdirectory directory style="display: none;">
+
+            <!-- 📁 文件列表区域 -->
+            <div id="fileList" class="file-list" style="display: none;">
+              <div class="file-summary">
+                <h4>📁 已导入文件 (<span id="fileCount">0</span> 个)</h4>
+                <button id="clearFiles" class="clear-btn">🗑️ 清空所有文件</button>
+              </div>
+              <div id="fileGrid" class="file-grid"></div>
+            </div>
+            <div style="margin-bottom: 20px;">
+              <label>🔑 关键字（逗号分隔）：</label>
+              <input type="text" id="keywords" value="预埋件,HILTI" placeholder="输入关键字，用逗号分隔">
+            </div>
+            <div style="margin-bottom: 20px;">
+              <button id="scanBtn">🚀 开始扫描</button>
+              <button id="exportCSV" disabled>📊 导出 CSV</button>
+              <button id="exportXLSX" disabled>📈 导出 Excel</button>
+              <label style="margin-left:auto;">每页行数：
+                <select id="resPageSize">
+                  <option>10</option>
+                  <option>20</option>
+                  <option>50</option>
+                  <option>100</option>
+                </select>
+              </label>
+              <div>
+                <button id="resPrevPage">上一页</button>
+                <button id="resNextPage">下一页</button>
+                <span id="resPageInfo" style="margin-left:8px;"></span>
+              </div>
+            </div>
+            <div id="progress"></div>
+            <div style="overflow-x: auto;">
+              <table id="resultsTable">
+                <thead>
+                  <tr>
+                    <th data-key="文件名">📄 文件名</th>
+                    <th data-key="对象类型">🏷️ 对象类型</th>
+                    <th data-key="图层">🎨 图层</th>
+                    <th data-key="关键字">🔑 关键字</th>
+                    <th data-key="匹配内容">📝 匹配内容</th>
+                  </tr>
+                  <tr class="filter-row">
+                    <th><select id="resSelectFile">
+                        <option value="">全部</option>
+                      </select></th>
+                    <th><select id="resSelectType">
+                        <option value="">全部</option>
+                      </select></th>
+                    <th><select id="resSelectLayer">
+                        <option value="">全部</option>
+                      </select></th>
+                    <th><select id="resSelectKeyword">
+                        <option value="">全部</option>
+                      </select></th>
+                    <th><input id="resFilterContentH" placeholder="筛选 内容包含"></th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+          <!-- =============== DXF 阀门信息统计 =============== -->
+          <div id="dxfValve" class="subtab-content">
+            <h3>🧰 DXF 阀门信息统计</h3>
+
+            <div id="valveDropZone" class="drop-zone">📁 将 DXF 文件拖拽到此处或点击选择文件</div>
+            <input type="file" id="valveFileInput" multiple accept=".dxf" style="display:none;">
+
+            <div id="valveFileList" class="file-list" style="display:none;">
+              <div class="file-summary">
+                <h4>📁 已导入文件 (<span id="valveFileCount">0</span> 个)</h4>
+                <button id="valveClearFiles" class="clear-btn">🗑️ 清空所有文件</button>
+              </div>
+              <div id="valveFileGrid" class="file-grid"></div>
+            </div>
+
+            <div style="margin-bottom:20px;">
+              <button id="valveScanBtn">🚀 开始提取阀门与风口信息</button>
+              <button id="valveExportCSV" disabled>📊 导出 CSV</button>
+              <button id="valveExportXLSX" disabled>📈 导出 Excel</button>
+            </div>
+
+            <div id="valveProgress"></div>
+
+            <div style="overflow-x:auto;">
+              <table id="valveResultsTable">
+                <thead>
+                  <tr>
+                    <th>📄 文件名</th>
+                    <th>📌 类型</th>
+                    <th>🏷 名称</th>
+                    <th>🔢 编号</th>
+                    <th>📐 尺寸</th>
+                    <th>📏 标高</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div id="dxfReplace" class="subtab-content">
+            <h3>🔄 DWG 图纸文字内容替换</h3>
+            <div id="repDropZone" class="drop-zone">📁 将 DXF 文件拖拽到此处或点击选择文件</div>
+            <input type="file" id="repFileInput" multiple accept=".dxf" webkitdirectory directory style="display:none;">
+            <div class="file-list" id="repFileList" style="display:none;">
+              <div class="file-summary">
+                <h4>📁 已导入文件 (<span id="repFileCount">0</span> 个)</h4>
+                <button id="repClearFiles" class="clear-btn">🗑️ 清空所有文件</button>
+              </div>
+              <div id="repFileGrid" class="file-grid"></div>
+            </div>
+            <div style="margin-top:20px;">
+              <h4>🔁 替换规则</h4>
+              <div id="repPairs"></div>
+            </div>
+            <div style="margin-top:20px; display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+              <button id="repScanBtn">🚀 执行替换模拟</button>
+              <button id="repConfirmBtn" disabled>✅ 确认执行替换</button>
+              <label style="display:flex;align-items:center;gap:6px;">
+                <input type="checkbox" id="repOverwrite">
+                直接保存到所选目录（可能覆盖源文件）
+              </label>
+              <button id="repExportCSV" disabled>📊 导出 CSV</button>
+              <button id="repExportXLSX" disabled>📈 导出 Excel</button>
+              <label style="margin-left:auto;">每页行数：
+                <select id="repPageSize">
+                  <option>10</option>
+                  <option>20</option>
+                  <option>50</option>
+                  <option>100</option>
+                </select>
+              </label>
+              <div>
+                <button id="repPrevPage">上一页</button>
+                <button id="repNextPage">下一页</button>
+                <span id="repPageInfo" style="margin-left:8px;"></span>
+              </div>
+            </div>
+            <div id="repProgress" style="margin-top:10px;"></div>
+            <div style="overflow-x:auto; margin-top:10px;">
+              <table id="repResultsTable">
+                <thead>
+                  <tr>
+                    <th data-key="文件名">📄 文件名</th>
+                    <th data-key="对象类型">🏷️ 对象类型</th>
+                    <th data-key="图层">🎨 图层</th>
+                    <th data-key="原内容">📝 原内容</th>
+                    <th data-key="替换后">📝 替换后</th>
+                    <th data-key="使用规则">🔑 使用规则</th>
+                  </tr>
+                  <tr class="filter-row">
+                    <th><select id="repSelectFile">
+                        <option value="">全部</option>
+                      </select></th>
+                    <th><select id="repSelectType">
+                        <option value="">全部</option>
+                      </select></th>
+                    <th><select id="repSelectLayer">
+                        <option value="">全部</option>
+                      </select></th>
+                    <th><input id="repFilterOriginalH" placeholder="筛选 原内容"></th>
+                    <th><input id="repFilterUpdatedH" placeholder="筛选 替换后"></th>
+                    <th><select id="repSelectRule">
+                        <option value="">全部</option>
+                      </select></th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+
+      <!-- Excel 工具集合 -->
+      <section id="excel" class="tab-content">
+        <div class="tool-card">
+          <h2>📊 Excel 工具集</h2>
+          <!-- =============== EXCEL MERGE TOOL ================ -->
+          <div id="excelMerge" class="subtab-content active"> <!-- Default active for Development/Preview -->
+            <h3>📊 Excel 多功能合并工具</h3>
+
+            <div id="excelDropZone" class="drop-zone">📁 将 Excel 文件拖拽到此处或点击选择文件 (.xlsx, .xls)</div>
+            <input type="file" id="excelFileInput" multiple accept=".xlsx,.xls,.csv" style="display:none;" />
+
+            <div id="excelFileList" class="file-list" style="display:none;">
+              <div class="file-summary">
+                <h4>📁 已准备处理 (<span id="excelFileCount">0</span> 个)</h4>
+                <button id="excelClearFiles" class="clear-btn">🗑️ 清空所有文件</button>
+              </div>
+              <div id="excelFileGrid" class="file-grid"></div>
+            </div>
+
+            <div class="control-panel"
+              style="margin-top: 20px; padding: 15px; background: var(--bg-hover); border-radius: 8px;">
+              <div class="form-group" style="margin-bottom: 15px;">
+                <label style="font-weight:bold; display:block; margin-bottom:10px;">🛠️ 选择功能模式：</label>
+
+                <div id="excelModeGrid" class="tool-grid">
+                  <div class="tool-btn-select active" data-value="merge-workbooks" data-anim-class="anim-wb"
+                    data-desc="将多个 Excel 工作簿的所有工作表合并到一个新的工作簿中，保留原工作表结构。">
+                    <div class="icon">📂</div>
+                    <div class="name">多工作簿 -> 工作簿</div>
+                  </div>
+                  <div class="tool-btn-select" data-value="merge-to-sheet" data-anim-class="anim-stack"
+                    data-desc="将多个工作簿/工作表的数据，按行或按列汇总到同一个工作表中。">
+                    <div class="icon">📑</div>
+                    <div class="name">多工作簿 -> 工作表</div>
+                  </div>
+                  <div class="tool-btn-select" data-value="internal-merge" data-anim-class="anim-internal"
+                    data-desc="将同一个工作簿内的多个工作表，合并到该工作簿的一个新Sheet中。">
+                    <div class="icon">🔄</div>
+                    <div class="name">工作簿内部汇总</div>
+                  </div>
+                  <div class="tool-btn-select" data-value="same-name-sheet" data-anim-class="anim-same"
+                    data-desc="从多个文件中提取名称相同的工作表（如'一月'），合并到结果文件的对应Sheet中。">
+                    <div class="icon">🏷️</div>
+                    <div class="name">同名Sheet汇总</div>
+                  </div>
+                  <div class="tool-btn-select" data-value="same-position" data-anim-class="anim-pos"
+                    data-desc="从多个文件的相同位置（如 A1）提取数据，汇总成一张清单。">
+                    <div class="icon">🎯</div>
+                    <div class="name">指定位置/单元格提取</div>
+                  </div>
+                  <div class="tool-btn-select" data-value="same-filename" data-anim-class="anim-wb"
+                    data-desc="处理同名文件冲突，或按文件名归类汇总。">
+                    <div class="icon">📁</div>
+                    <div class="name">同名文件汇总</div>
+                  </div>
+                  <div class="tool-btn-select" data-value="merge-dynamic" data-anim-class="anim-dyn"
+                    data-desc="[开发中] 智能识别表头，按字段名称对齐合并，无需列序一致。">
+                    <div class="icon">🧩</div>
+                    <div class="name">合并动态字段</div>
+                  </div>
+                  <div class="tool-btn-select" data-value="collab-merge" data-anim-class="anim-clb"
+                    data-desc="多人协同填表模式。自动检测并标记不同人填写的内容冲突，生成冲突报告。">
+                    <div class="icon">🤝</div>
+                    <div class="name">多人协同冲突合并</div>
+                  </div>
+                </div>
+                <input type="hidden" id="excelModeSelect" value="merge-workbooks">
+              </div>
+
+              <!-- Dynamic Options Rendered Here -->
+              <div id="excelOptionsPanel"></div>
+            </div>
+
+            <div style="margin-top: 20px; display: flex; align-items: center; gap: 15px;">
+              <button id="excelPreviewBtn" class="tool-btn" style="flex: 1; background: #FF9800;">👁️ 预览结果</button>
+              <button id="excelProcessBtn" class="tool-btn" style="flex: 2;">🚀 开始处理</button>
+              <span id="excelProgress" style="font-size: 14px; color: var(--text-secondary);"></span>
+            </div>
+          </div>
+        </div>
+    </div>
+    </section>
+
+    <!-- Preview Modal -->
+    <div id="previewModal" class="modal"
+      style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:1000;">
+      <div class="modal-content"
+        style="position:relative; background:var(--bg-card, #fff); color:var(--text-primary, #333); margin:5% auto; padding:20px; width:90%; height:80%; overflow:hidden; border-radius:8px; display:flex; flex-direction:column; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+          <h3 style="margin:0;">📊 结果预览 (前50行)</h3>
+          <button onclick="document.getElementById('previewModal').style.display='none'"
+            class="modal-close-btn">&times;</button>
+        </div>
+        <div id="previewTabs" style="display:flex; gap:5px; margin-bottom:10px; overflow-x:auto; padding-bottom:5px;">
+        </div>
+        <div id="previewContainer"
+          style="flex:1; overflow:auto; border:1px solid var(--border-color, #eee); padding:10px;"></div>
+        <div style="margin-top:10px; text-align:right;">
+          <button onclick="document.getElementById('previewModal').style.display='none'"
+            style="padding:8px 20px; border:1px solid var(--border-color, #ccc); background:var(--bg-hover, #f5f5f5); color:var(--text-primary, #333); border-radius:4px; cursor:pointer;">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Word 工具集合 -->
+    <section id="word" class="tab-content">
+      <div class="tool-card">
+        <h2>📝 Word 工具集</h2>
+        <div class="placeholder-card">
+          <div class="placeholder-icon">📄</div>
+          <p>Word 格式文本设置功能（开发中）</p>
+        </div>
+      </div>
+    </section>
+    </div>
+  </main>
+
+  <!-- Animated Tooltip Container -->
+  <div id="animTooltip">
+    <div class="anim-stage" id="animStage"></div>
+    <div class="anim-desc" id="animDesc"></div>
+  </div>
+
+  <script src="dxf-parser.min.js"></script>
+  <script src="app.js"></script>
+  <script src="dxf_search.js"></script>
+  <script src="replace.js"></script>
+  <script src="excel_merge.js"></script>
+</body>
+
+</html>

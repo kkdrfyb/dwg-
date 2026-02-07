@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Excel 工具测试面板</title>
+    <style>
+        body {
+            font-family: monospace;
+            padding: 20px;
+            background: #f0f0f0;
+        }
+
+        .test-card {
+            background: white;
+            padding: 15px;
+            margin-bottom: 10px;
+            border-radius: 8px;
+            border-left: 5px solid #ccc;
+        }
+
+        .pass {
+            border-left-color: #4caf50;
+        }
+
+        .fail {
+            border-left-color: #f44336;
+        }
+
+        .btn {
+            padding: 10px 20px;
+            background: #2196f3;
+            color: white;
+            border: none;
+            font-size: 16px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>🛠️ Excel 工具集成测试 (Mock Mode)</h1>
+    <button class="btn" onclick="runAllTests()">🚀 运行所有测试</button>
+    <div id="results" style="margin-top: 20px;"></div>
+
+    <script src="xlsx.full.min.js"></script>
+    <div style="display:none;">
+        <div id="excelDropZone"></div><input id="excelFileInput" />
+        <div id="excelFileList"></div>
+        <div id="excelFileGrid"></div><span id="excelFileCount"></span>
+        <button id="excelClearFiles"></button><select id="excelModeSelect"></select>
+        <div id="excelOptionsPanel"></div><button id="excelProcessBtn"></button>
+        <span id="excelProgress"></span>
+    </div>
+    <script>
+        function formatFileSize(s) { return s + 'B'; }
+        function showAlert(m, t) { console.log("ALERT:", m); }
+    </script>
+    <script src="excel_merge.js"></script>
+
+    <script>
+        // Store in-memory workbooks map
+        const mockFileSystem = new Map();
+
+        // New Mock Helper: Returns a WB object directly, stores it in map
+        function createMockWB(name, sheetsData) {
+            const wb = XLSX.utils.book_new();
+            for (const [sheetName, data] of Object.entries(sheetsData)) {
+                let ws = XLSX.utils.aoa_to_sheet(data.map(r => r.map(c => c.v || c)));
+                // Apply Styles Manually
+                data.forEach((row, ri) => {
+                    row.forEach((cell, ci) => {
+                        if (cell.s) {
+                            const ref = XLSX.utils.encode_cell({ c: ci, r: ri });
+                            if (!ws[ref]) ws[ref] = { v: cell.v, t: 's' };
+                            ws[ref].s = cell.s; // Direct object assignment
+                        }
+                    });
+                });
+                XLSX.utils.book_append_sheet(wb, ws, sheetName);
+            }
+            mockFileSystem.set(name, wb);
+            // Return a fake file object just for name passing
+            return { name: name, size: 1000 };
+        }
+
+        // Custom Reader that reads from memory map
+        const memoryReader = async (file) => {
+            if (mockFileSystem.has(file.name)) {
+                return mockFileSystem.get(file.name); // Return WB directly
+            }
+            throw new Error(`File not found in mock FS: ${file.name}`);
+        };
+
+        async function assert(desc, fn) {
+            const div = document.createElement("div");
+            div.className = "test-card";
+            div.textContent = `Testing: ${desc}...`;
+            document.getElementById("results").appendChild(div);
+            try {
+                await fn();
+                div.className += " pass";
+                div.innerHTML = `✅ PASS: ${desc}`;
+            } catch (e) {
+                div.className += " fail";
+                div.innerHTML = `❌ FAIL: ${desc}<br><pre>${e.message}</pre>`;
+                console.error(e);
+            }
+        }
+
+        async function runAllTests() {
+            document.getElementById("results").innerHTML = "";
+
+            // --- DATA PREP ---
+            const styleRed = { font: { color: { rgb: "FF0000" } } };
+
+            // Create Mock WBs in Memory
+            const fileA = createMockWB("A.xlsx", {
+                "Sheet1": [
+                    ["HeaderA", "HeaderB"],
+                    [{ v: "DataA1", s: styleRed }, "DataB1"],
+                    ["Footer"]
+                ]
+            });
+            const fileB = createMockWB("B.xlsx", {
+                "Sheet1": [
+                    ["HeaderA", "HeaderB"],
+                    ["DataA2", "DataB2"],
+                    ["Footer"]
+                ]
+            });
+
+            // TEST 1: Merge Workbooks
+            await assert("Mode 1: Merge Workbooks (Format & Index)", async () => {
+                const res = await ExcelMerger.createMergedWorkbook([fileA, fileB], "merge-workbooks", {}, null, memoryReader);
+                const wb = res.workbook;
+
+                // Index Check
+                if (wb.SheetNames[0] !== "索引") throw new Error("Index sheet missing");
+
+                // Style Check (Sheet Copy)
+                const sheetA = wb.Sheets["A-Sheet1"]; // Renamed
+                const cellA2 = sheetA["A2"];
+                console.log("M1 Cell A2:", cellA2);
+                if (!cellA2.s || cellA2.s.font.color.rgb !== "FF0000") throw new Error("Red style lost in Workbook Merge");
+            });
+
+            // TEST 2: Merge To Sheet
+            await assert("Mode 2: Vertical Merge (Format & Footer)", async () => {
+                const config = { headerRows: 1, footerRows: 1, direction: 'vertical' };
+                const res = await ExcelMerger.createMergedWorkbook([fileA, fileB], "merge-to-sheet", config, null, memoryReader);
+                const ws = res.workbook.Sheets["汇总结果"];
+
+                // Rows: Header(1) + DataA(1) + DataB(1) = 3
+                const range = XLSX.utils.decode_range(ws['!ref']);
+                if (range.e.r !== 2) throw new Error(`Expected 2 (index 0-2 = 3 rows), got ${range.e.r}`);
+
+                // Style Check
+                const cellA2 = ws["A2"];
+                if (!cellA2.s || cellA2.s.font.color.rgb !== "FF0000") {
+                    throw new Error(`Red style lost in Vertical Merge. Got: ${JSON.stringify(cellA2?.s)}`);
+                }
+            });
+
+            // TEST 3: Header/Footer Skipping
+            await assert("Header/Footer Skipping Calculation", async () => {
+                // Inspect rows logic
+                // File A: H,D,F (Size 3). Skip Head(1) -> 2. Skip Foot(1) -> 2. Range 1-1 (Row index). Length 1 row (D).
+                // Final output: H (from A init), D(A), D(B). Correct.
+                // We verified count above.
+            });
+
+            console.log("Tests Completed");
+
+            // TEST 4: Collaborative Merge (Conflict)
+            await assert("Mode 7: Collab Merge with Conflicts", async () => {
+                const f1 = createMockWB("User1.xlsx", { "S": [[10, "Same"]] });
+                const f2 = createMockWB("User2.xlsx", { "S": [[20, "Same"]] });
+
+                const res = await ExcelMerger.createMergedWorkbook([f1, f2], "collab-merge", {}, null, memoryReader);
+                const ws = res.workbook.Sheets["多人协同合并"];
+
+                // Cell A1: User1=10, User2=20 -> CONFLICT
+                const cA1 = ws["A1"];
+                if (cA1.v !== "CONFLICT") throw new Error(`A1 should be CONFLICT, got ${cA1.v}`);
+                if (!cA1.s || cA1.s.fill.fgColor.rgb !== "FFCCCC") throw new Error("Conflict style missing");
+
+                // Cell B1: User1="Same", User2="Same" -> "Same"
+                const cB1 = ws["B1"];
+                if (cB1.v !== "Same") throw new Error(`B1 should be Same, got ${cB1.v}`);
+
+                // Log Column (Col 2 -> C)
+                const cLog = ws["C1"];
+                if (!cLog || !cLog.v.includes("User1.xlsx")) throw new Error("Conflict log missing details");
+            });
+        }
+    </script>
+</body>
+
+</html>

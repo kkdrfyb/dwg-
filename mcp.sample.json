@@ -1,0 +1,34 @@
+{
+  "servers": [
+    {
+      "name": "filesystem",
+      "command": "path-to-filesystem-mcp",
+      "args": [],
+      "env": {}
+    },
+    {
+      "name": "sqlite",
+      "command": "path-to-sqlite-mcp",
+      "args": [],
+      "env": {}
+    },
+    {
+      "name": "office",
+      "command": "path-to-office-mcp",
+      "args": [],
+      "env": {}
+    },
+    {
+      "name": "ocr",
+      "command": "path-to-ocr-mcp",
+      "args": [],
+      "env": {}
+    },
+    {
+      "name": "diff",
+      "command": "path-to-diff-mcp",
+      "args": [],
+      "env": {}
+    }
+  ]
+}
