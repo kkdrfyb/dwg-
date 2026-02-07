@@ -6,7 +6,7 @@
   IgnorableNamespaces="uap rescap">
   <Identity Name="DwgOfficeToolbox"
             Publisher="CN=DWGOfficeToolbox"
-            Version="1.0.1.0" />
+            Version="1.0.2.0" />
   <Properties>
     <DisplayName>DWG办公工具箱</DisplayName>
     <PublisherDisplayName>DWG办公工具箱</PublisherDisplayName>
