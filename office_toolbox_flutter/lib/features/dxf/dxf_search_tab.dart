@@ -1,24 +1,16 @@
 import 'dart:math';
 
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_picker/file_picker.dart';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../../core/export/export_utils.dart';
-import '../../core/logging/log_service.dart';
-import '../../core/task/task_limiter.dart';
 import '../../core/task/task_service.dart';
 import '../../widgets/section_card.dart';
-import 'dxf_isolate.dart';
+import 'dxf_cache_service.dart';
+import 'dxf_file_helper.dart';
 import 'dxf_models.dart';
-
-class _SearchPayload {
-  const _SearchPayload({required this.file, required this.response});
-
-  final PlatformFile file;
-  final Map<String, dynamic> response;
-}
 
 class DxfSearchTab extends StatefulWidget {
   const DxfSearchTab({super.key});
@@ -29,10 +21,13 @@ class DxfSearchTab extends StatefulWidget {
 
 class _DxfSearchTabState extends State<DxfSearchTab> {
   final TextEditingController _keywordsController = TextEditingController();
+  final ScrollController _fileScrollController = ScrollController();
   final List<PlatformFile> _files = [];
   final List<DxfSearchResult> _results = [];
 
   bool _isRunning = false;
+  bool _isDragging = false;
+  bool _pendingIndex = false;
   double _progress = 0;
   String _status = '';
   String? _activeTaskId;
@@ -48,6 +43,7 @@ class _DxfSearchTabState extends State<DxfSearchTab> {
   @override
   void dispose() {
     _keywordsController.dispose();
+    _fileScrollController.dispose();
     super.dispose();
   }
 
@@ -55,32 +51,133 @@ class _DxfSearchTabState extends State<DxfSearchTab> {
     final result = await FilePicker.platform.pickFiles(
       allowMultiple: true,
       type: FileType.custom,
-      allowedExtensions: const ['dxf'],
+      allowedExtensions: const ['dwg', 'dxf'],
     );
     if (result == null) return;
 
+    final files = result.files.where((file) => file.path != null).toList();
+    if (files.isEmpty) return;
+    _addFiles(files);
+  }
+
+  Future<void> _pickFolder() async {
+    final path = await FilePicker.platform.getDirectoryPath();
+    if (path == null) return;
+
+    final files = await collectDxfFilesFromPaths([path]);
+    if (!mounted) return;
+    if (files.isEmpty) {
+      _showSnack('文件夹内未找到 DWG/DXF 文件');
+      return;
+    }
+    _addFiles(files);
+  }
+
+  Future<void> _handleDrop(List<String> paths) async {
+    if (paths.isEmpty) return;
+    final files = await collectDxfFilesFromPaths(paths);
+    if (!mounted) return;
+    if (files.isEmpty) {
+      _showSnack('未识别到 DWG/DXF 文件');
+      return;
+    }
+    _addFiles(files);
+  }
+
+  void _addFiles(List<PlatformFile> files) {
+    final existing = _files.map((f) => f.path).whereType<String>().toSet();
+    final added = <PlatformFile>[];
+    for (final file in files) {
+      final path = file.path;
+      if (path == null) continue;
+      if (existing.add(path)) {
+        added.add(file);
+      }
+    }
+    if (added.isEmpty) {
+      _showSnack('没有新增文件');
+      return;
+    }
     setState(() {
-      _files
-        ..clear()
-        ..addAll(result.files.where((file) => file.path != null));
+      _files.addAll(added);
     });
+    _scheduleIndex();
   }
 
   void _removeFile(PlatformFile file) {
     setState(() {
       _files.remove(file);
     });
+    _scheduleIndex();
   }
 
   void _clearFiles() {
     setState(() {
       _files.clear();
+      _results.clear();
     });
+    _scheduleIndex();
+  }
+
+  void _scheduleIndex() {
+    if (_isRunning) {
+      _pendingIndex = true;
+      return;
+    }
+    _runIndex();
+  }
+
+  Future<void> _runIndex() async {
+    final taskService = context.read<TaskService>();
+    final cache = context.read<DxfCacheService>();
+    final handle = taskService.startTask('DXF 索引更新');
+
+    setState(() {
+      _isRunning = true;
+      _progress = 0;
+      _status = '准备更新索引...';
+      _activeTaskId = handle.id;
+    });
+
+    final ok = await taskService.runTask<bool>(handle, (taskContext) async {
+      await cache.ensureIndex(
+        _files,
+        taskContext,
+        onProgress: (progress, message) {
+          if (!mounted) return;
+          setState(() {
+            _progress = progress;
+            _status = message;
+          });
+        },
+      );
+      return true;
+    });
+
+    if (!mounted) return;
+
+    if (ok == null) {
+      setState(() {
+        _isRunning = false;
+        _status = '已取消';
+      });
+    } else {
+      setState(() {
+        _isRunning = false;
+        _progress = 1;
+        _status = '索引更新完成';
+      });
+    }
+
+    if (_pendingIndex) {
+      _pendingIndex = false;
+      _runIndex();
+    }
   }
 
   Future<void> _startScan() async {
     if (_files.isEmpty) {
-      _showSnack('请先选择 DXF 文件');
+      _showSnack('请先选择 DWG/DXF 文件');
       return;
     }
 
@@ -91,83 +188,42 @@ class _DxfSearchTabState extends State<DxfSearchTab> {
         .toList();
 
     final taskService = context.read<TaskService>();
-    final log = context.read<LogService>();
-    final handle = taskService.startTask('DXF 关键字扫描');
+    final cache = context.read<DxfCacheService>();
+    final handle = taskService.startTask('DXF 关键字查询');
 
     setState(() {
       _isRunning = true;
       _progress = 0;
-      _status = '准备扫描 ${_files.length} 个文件...';
+      _status = '准备查询...';
       _results.clear();
       _activeTaskId = handle.id;
     });
 
-    final tasks = _files
-        .map(
-          (file) => () async {
-            try {
-              final response = await compute(scanDxfFileForKeywords, {
-                'path': file.path,
-                'name': file.name,
-                'keywords': keywords,
-                'size': file.size,
-              });
-              return _SearchPayload(file: file, response: response);
-            } catch (error) {
-              return _SearchPayload(
-                file: file,
-                response: {'ok': false, 'error': error.toString(), 'results': <Map<String, String>>[]},
-              );
-            }
-          },
-        )
-        .toList();
-
-    final payloads = await taskService.runTask<List<_SearchPayload>>(handle, (context) async {
-      final limiter = TaskLimiter.auto();
-      return limiter.run<_SearchPayload>(
-        tasks,
-        isCanceled: context.isCanceled,
-        onItemCompleted: (index, completed, total) {
-          final progress = completed / max(1, total);
-          context.updateProgress(progress, message: '扫描中 ($completed/$total)');
-          if (mounted) {
-            setState(() {
-              _progress = progress;
-              _status = '扫描中 ($completed/$total): ${_files[index].name}';
-            });
-          }
+    final results = await taskService.runTask<List<DxfSearchResult>>(handle, (taskContext) async {
+      await cache.ensureIndex(
+        _files,
+        taskContext,
+        onProgress: (progress, message) {
+          if (!mounted) return;
+          setState(() {
+            _progress = progress;
+            _status = message;
+          });
         },
       );
+      if (taskContext.isCanceled()) return null;
+      final data = await cache.queryKeywords(keywords);
+      return data;
     });
 
     if (!mounted) return;
 
-    if (payloads == null) {
+    if (results == null) {
       setState(() {
         _isRunning = false;
         _status = '已取消';
       });
       return;
-    }
-
-    final results = <DxfSearchResult>[];
-    for (final payload in payloads) {
-      final response = payload.response;
-      final ok = response['ok'] == true;
-      if (!ok && response['error'] != null) {
-        await log.warn('解析失败: ${payload.file.name}', context: 'dxf', error: response['error']);
-      }
-      final items = (response['results'] as List)
-          .map((item) => DxfSearchResult(
-                fileName: item['fileName'] as String,
-                objectType: item['objectType'] as String,
-                layer: item['layer'] as String,
-                keyword: item['keyword'] as String,
-                content: item['content'] as String,
-              ))
-          .toList();
-      results.addAll(items);
     }
 
     setState(() {
@@ -176,9 +232,7 @@ class _DxfSearchTabState extends State<DxfSearchTab> {
         ..addAll(results);
       _isRunning = false;
       _progress = 1;
-      _status = results.isEmpty
-          ? '扫描完成，未找到匹配内容'
-          : '扫描完成，找到 ${results.length} 条结果';
+      _status = results.isEmpty ? '查询完成，未找到匹配内容' : '查询完成，找到 ${results.length} 条结果';
     });
   }
 
@@ -247,6 +301,7 @@ class _DxfSearchTabState extends State<DxfSearchTab> {
     final types = _unique(_results.map((e) => e.objectType).toList());
     final layers = _unique(_results.map((e) => e.layer).toList());
     final keywords = _unique(_results.map((e) => e.keyword).toList());
+    final theme = Theme.of(context);
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -254,8 +309,8 @@ class _DxfSearchTabState extends State<DxfSearchTab> {
         return ListView(
           children: [
             SectionCard(
-              title: 'DXF 关键字查找',
-              subtitle: '支持批量扫描、过滤与导出。',
+              title: 'DWG 关键字查找',
+              subtitle: '自动转 DXF 并建立索引，支持批量查询与导出。',
               trailing: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -275,39 +330,120 @@ class _DxfSearchTabState extends State<DxfSearchTab> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    crossAxisAlignment: WrapCrossAlignment.center,
-                    children: [
-                      FilledButton.icon(
-                        onPressed: _pickFiles,
-                        icon: const Icon(Icons.upload_file),
-                        label: const Text('选择 DXF 文件'),
+                  DropTarget(
+                    onDragEntered: (_) => setState(() => _isDragging = true),
+                    onDragExited: (_) => setState(() => _isDragging = false),
+                    onDragDone: (detail) async {
+                      setState(() => _isDragging = false);
+                      await _handleDrop(detail.files.map((file) => file.path).toList());
+                    },
+                    child: Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: _isDragging
+                            ? theme.colorScheme.primary.withOpacity(0.08)
+                            : theme.colorScheme.surfaceVariant.withOpacity(0.2),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: _isDragging
+                              ? theme.colorScheme.primary
+                              : theme.dividerColor,
+                        ),
                       ),
-                      OutlinedButton.icon(
-                        onPressed: _files.isEmpty ? null : _clearFiles,
-                        icon: const Icon(Icons.delete_outline),
-                        label: const Text('清空列表'),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 8,
+                            crossAxisAlignment: WrapCrossAlignment.center,
+                            children: [
+                              FilledButton.icon(
+                                onPressed: _pickFiles,
+                                icon: const Icon(Icons.upload_file),
+                                label: const Text('选择 DWG 文件'),
+                              ),
+                              OutlinedButton.icon(
+                                onPressed: _pickFolder,
+                                icon: const Icon(Icons.folder_open),
+                                label: const Text('选择文件夹'),
+                              ),
+                              Text('支持拖拽文件或文件夹到此区域',
+                                  style: theme.textTheme.bodySmall),
+                            ],
+                          ),
+                        ],
                       ),
-                      Text('已选择 ${_files.length} 个文件'),
-                    ],
-                  ),
-                  if (_files.isNotEmpty) ...[
-                    const SizedBox(height: 12),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: _files
-                          .map(
-                            (file) => Chip(
-                              label: Text(file.name),
-                              onDeleted: () => _removeFile(file),
-                            ),
-                          )
-                          .toList(),
                     ),
-                  ],
+                  ),
+                  const SizedBox(height: 12),
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: theme.colorScheme.surface,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: theme.dividerColor),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Text(
+                              '已上传文件 (${_files.length})',
+                              style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w600),
+                            ),
+                            const Spacer(),
+                            TextButton.icon(
+                              onPressed: _files.isEmpty ? null : _clearFiles,
+                              icon: const Icon(Icons.delete_outline),
+                              label: const Text('清空'),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        SizedBox(
+                          height: 180,
+                          child: _files.isEmpty
+                              ? Center(
+                                  child: Text('暂无文件', style: theme.textTheme.bodySmall),
+                                )
+                              : Scrollbar(
+                                  controller: _fileScrollController,
+                                  thumbVisibility: true,
+                                  child: ListView.separated(
+                                    controller: _fileScrollController,
+                                    itemCount: _files.length,
+                                    separatorBuilder: (_, __) => const Divider(height: 1),
+                                    itemBuilder: (context, index) {
+                                      final file = _files[index];
+                                      final path = file.path ?? '';
+                                      return ListTile(
+                                        dense: true,
+                                        visualDensity: VisualDensity.compact,
+                                        leading: const Icon(Icons.description_outlined, size: 20),
+                                        title: Text(file.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+                                        subtitle: path.isEmpty
+                                            ? null
+                                            : Text(
+                                                path,
+                                                maxLines: 1,
+                                                overflow: TextOverflow.ellipsis,
+                                              ),
+                                        trailing: IconButton(
+                                          tooltip: '移除',
+                                          icon: const Icon(Icons.close),
+                                          onPressed: () => _removeFile(file),
+                                        ),
+                                      );
+                                    },
+                                  ),
+                                ),
+                        ),
+                      ],
+                    ),
+                  ),
                   const SizedBox(height: 16),
                   TextField(
                     controller: _keywordsController,

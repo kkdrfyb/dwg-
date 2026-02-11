@@ -10,7 +10,8 @@ Map<String, dynamic> scanDxfFileForKeywords(Map<String, dynamic> request) {
   final lowerKeywords = keywords.map((k) => k.toLowerCase()).toList();
   final size = request['size'] as int? ?? 0;
   final forcePlain = request['forcePlain'] == true;
-  final largeFile = size > dxfLargeFileThreshold || forcePlain;
+  final forceParse = request['forceParse'] == true;
+  final largeFile = (size > dxfLargeFileThreshold || forcePlain) && !forceParse;
 
   try {
     final text = readDxfFile(path);
@@ -181,18 +182,20 @@ List<Map<String, String>> _plainTextMatches(
     });
     return results;
   }
-  final lower = text.toLowerCase();
-  final lowerKeywords = keywords.map((k) => k.toLowerCase()).toList();
-  for (var i = 0; i < lowerKeywords.length; i++) {
-    final keyword = keywords[i];
-    if (keyword.isEmpty) continue;
-    if (lower.contains(lowerKeywords[i])) {
+  for (final keyword in keywords) {
+    if (keyword.trim().isEmpty) continue;
+    final re = RegExp(RegExp.escape(keyword), caseSensitive: false);
+    for (final match in re.allMatches(text)) {
+      final pos = match.start;
+      final contextStart = max(0, pos - 20);
+      final contextEnd = min(text.length, pos + keyword.length + 20);
+      final snippet = text.substring(contextStart, contextEnd);
       results.add({
         'fileName': fileName,
-        'objectType': '未知',
+        'objectType': '文本',
         'layer': '-',
         'keyword': keyword,
-        'content': '(纯文本匹配)',
+        'content': snippet,
       });
     }
   }
