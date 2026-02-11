@@ -1,0 +1,6 @@
+# Copy this file to android/key.properties and fill in real values.
+# storeFile can be a relative path from android/app (e.g. ../keystore/office_toolbox.jks)
+storeFile=../keystore/office_toolbox.jks
+storePassword=CHANGE_ME
+keyAlias=office_toolbox
+keyPassword=CHANGE_ME
