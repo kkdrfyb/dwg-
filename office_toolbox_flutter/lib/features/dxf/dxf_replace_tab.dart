@@ -27,6 +27,18 @@ class _ReplacePayload {
   final Map<String, dynamic> response;
 }
 
+class _ApplySummary {
+  const _ApplySummary({
+    required this.written,
+    required this.skipped,
+    required this.failed,
+  });
+
+  final int written;
+  final int skipped;
+  final int failed;
+}
+
 class DxfReplaceTab extends StatefulWidget {
   const DxfReplaceTab({super.key});
 
@@ -39,6 +51,8 @@ class _DxfReplaceTabState extends State<DxfReplaceTab> {
   final List<PlatformFile> _files = [];
   final List<_PairRow> _pairRows = [_PairRow()];
   final List<DxfReplaceResult> _results = [];
+  final Map<String, DxfPreparedFile> _preparedByDxfPath = {};
+  final List<DxfReplacePair> _scanPairs = [];
 
   bool _isRunning = false;
   bool _isDragging = false;
@@ -128,7 +142,11 @@ class _DxfReplaceTabState extends State<DxfReplaceTab> {
   }
 
   void _clearFiles() {
-    setState(() => _files.clear());
+    setState(() {
+      _files.clear();
+      _preparedByDxfPath.clear();
+      _scanPairs.clear();
+    });
   }
 
   void _addPair() {
@@ -169,6 +187,14 @@ class _DxfReplaceTabState extends State<DxfReplaceTab> {
       _showSnack('请至少输入一组替换规则');
       return;
     }
+    _scanPairs
+      ..clear()
+      ..addAll(
+        pairs.map(
+          (pair) =>
+              DxfReplacePair(find: pair.find, replaceWith: pair.replaceWith),
+        ),
+      );
 
     final taskService = context.read<TaskService>();
     final log = context.read<LogService>();
@@ -180,10 +206,14 @@ class _DxfReplaceTabState extends State<DxfReplaceTab> {
       _progress = 0;
       _status = '准备处理 ${_files.length} 个文件...';
       _results.clear();
+      _preparedByDxfPath.clear();
       _activeTaskId = handle.id;
     });
 
-    final payloads = await taskService.runTask<List<_ReplacePayload>>(handle, (context) async {
+    var preparedFiles = <DxfPreparedFile>[];
+    final payloads = await taskService.runTask<List<_ReplacePayload>>(handle, (
+      context,
+    ) async {
       final prepared = await cache.prepareSources(
         _files,
         context,
@@ -195,6 +225,7 @@ class _DxfReplaceTabState extends State<DxfReplaceTab> {
           });
         },
       );
+      preparedFiles = prepared;
 
       if (prepared.isEmpty) return <_ReplacePayload>[];
 
@@ -207,17 +238,26 @@ class _DxfReplaceTabState extends State<DxfReplaceTab> {
                   'name': file.sourceName,
                   'size': file.dxfSize,
                   'pairs': pairs
-                      .map((pair) => {
-                            'find': pair.find,
-                            'replace': pair.replaceWith,
-                          })
+                      .map(
+                        (pair) => {
+                          'find': pair.find,
+                          'replace': pair.replaceWith,
+                        },
+                      )
                       .toList(),
                 });
-                return _ReplacePayload(fileName: file.sourceName, response: response);
+                return _ReplacePayload(
+                  fileName: file.sourceName,
+                  response: response,
+                );
               } catch (error) {
                 return _ReplacePayload(
                   fileName: file.sourceName,
-                  response: {'ok': false, 'error': error.toString(), 'results': <Map<String, String>>[]},
+                  response: {
+                    'ok': false,
+                    'error': error.toString(),
+                    'results': <Map<String, String>>[],
+                  },
                 );
               }
             },
@@ -234,7 +274,8 @@ class _DxfReplaceTabState extends State<DxfReplaceTab> {
           if (mounted) {
             setState(() {
               _progress = progress;
-              _status = '处理中 ($completed/$total): ${prepared[index].sourceName}';
+              _status =
+                  '处理中 ($completed/$total): ${prepared[index].sourceName}';
             });
           }
         },
@@ -251,11 +292,19 @@ class _DxfReplaceTabState extends State<DxfReplaceTab> {
       return;
     }
 
+    for (final prepared in preparedFiles) {
+      _preparedByDxfPath[_normalizePathKey(prepared.dxfPath)] = prepared;
+    }
+
     final results = <DxfReplaceResult>[];
     for (final payload in payloads) {
       final response = payload.response;
       if (response['ok'] != true && response['error'] != null) {
-        await log.warn('解析失败: ${payload.fileName}', context: 'dxf', error: response['error']);
+        await log.warn(
+          '解析失败: ${payload.fileName}',
+          context: 'dxf',
+          error: response['error'],
+        );
       }
 
       final items = (response['results'] as List)
@@ -303,8 +352,16 @@ class _DxfReplaceTabState extends State<DxfReplaceTab> {
       return;
     }
 
+    if (!_overwrite && _outputDir != null) {
+      final outputDir = Directory(_outputDir!);
+      if (!outputDir.existsSync()) {
+        outputDir.createSync(recursive: true);
+      }
+    }
+
     final taskService = context.read<TaskService>();
     final log = context.read<LogService>();
+    final cache = context.read<DxfCacheService>();
     final handle = taskService.startTask('DXF 确认替换');
 
     setState(() {
@@ -315,61 +372,251 @@ class _DxfReplaceTabState extends State<DxfReplaceTab> {
     });
 
     final byFile = <String, List<DxfReplaceResult>>{};
+    final allByFile = <String, List<DxfReplaceResult>>{};
     for (final result in activeResults) {
       byFile.putIfAbsent(result.filePath, () => []).add(result);
     }
+    for (final result in _results) {
+      allByFile.putIfAbsent(result.filePath, () => []).add(result);
+    }
 
-    await taskService.runTask<void>(handle, (context) async {
+    final summary = await taskService.runTask<_ApplySummary>(handle, (
+      context,
+    ) async {
       final targets = byFile.keys.toList();
+      final usedOutputPaths = <String>{};
+      var written = 0;
+      var skipped = 0;
+      var failed = 0;
+
       for (var index = 0; index < targets.length; index++) {
         if (context.isCanceled()) throw TaskCanceled();
-        final filePath = targets[index];
-        final fileResults = byFile[filePath] ?? [];
+        final dxfPath = targets[index];
+
+        final fileResults = byFile[dxfPath] ?? [];
         final progress = index / max(1, targets.length);
-        context.updateProgress(progress, message: '写入: ${p.basename(filePath)}');
+        context.updateProgress(progress, message: '写入: ${p.basename(dxfPath)}');
         if (mounted) {
           setState(() {
             _progress = progress;
-            _status = '写入中 (${index + 1}/${targets.length}): ${p.basename(filePath)}';
+            _status =
+                '写入中 (${index + 1}/${targets.length}): ${p.basename(dxfPath)}';
           });
         }
 
-        var text = await readDxfFileAsync(filePath);
-        final counts = <String, int>{};
-        for (final item in fileResults) {
-          final key = '${item.originalText}:::${item.updatedText}';
-          counts[key] = (counts[key] ?? 0) + 1;
-        }
-        for (final entry in counts.entries) {
-          final parts = entry.key.split(':::');
-          if (parts.length != 2) continue;
-          text = replaceLimited(text, parts[0], parts[1], entry.value);
-        }
+        try {
+          final sourceInfo = _preparedByDxfPath[_normalizePathKey(dxfPath)];
+          final sourcePath = sourceInfo?.sourcePath ?? dxfPath;
+          final sourceExt = p.extension(sourcePath).toLowerCase();
+          final isDwgSource = sourceExt == '.dwg';
 
-        final outputPath = _resolveOutputPath(filePath);
-        await File(outputPath).writeAsString(text, flush: true);
-        await log.info('已写入: $outputPath', context: 'dxf');
+          final dxfFile = File(dxfPath);
+          if (!dxfFile.existsSync()) {
+            failed++;
+            await log.warn('DXF 文件不存在，跳过写入: $dxfPath', context: 'dxf');
+            continue;
+          }
+
+          final originalText = await readDxfFileAsync(dxfPath);
+          var updatedText = originalText;
+          final totalRows = allByFile[dxfPath]?.length ?? fileResults.length;
+          final useFastRulePath =
+              _scanPairs.isNotEmpty && fileResults.length == totalRows;
+
+          if (useFastRulePath) {
+            for (final pair in _scanPairs) {
+              if (pair.find.isEmpty) {
+                continue;
+              }
+              final pattern = RegExp(
+                RegExp.escape(pair.find),
+                caseSensitive: false,
+              );
+              updatedText = updatedText.replaceAllMapped(
+                pattern,
+                (_) => pair.replaceWith,
+              );
+            }
+          } else {
+            final counts = <String, int>{};
+            for (final item in fileResults) {
+              final key = '${item.originalText}:::${item.updatedText}';
+              counts[key] = (counts[key] ?? 0) + 1;
+            }
+            for (final entry in counts.entries) {
+              final parts = entry.key.split(':::');
+              if (parts.length != 2) continue;
+              updatedText = replaceLimited(
+                updatedText,
+                parts[0],
+                parts[1],
+                entry.value,
+              );
+            }
+          }
+
+          if (updatedText == originalText) {
+            skipped++;
+            await log.warn('未检测到实际文本变化，跳过: $sourcePath', context: 'dxf');
+            continue;
+          }
+
+          if (isDwgSource) {
+            context.updateProgress(
+              progress,
+              message: '转换 DWG: ${p.basename(sourcePath)}',
+            );
+            if (mounted) {
+              setState(() {
+                _status =
+                    '转换 DWG (${index + 1}/${targets.length}): ${p.basename(sourcePath)}';
+              });
+            }
+            if (_overwrite) {
+              await dxfFile.writeAsString(updatedText, flush: true);
+              await cache.convertDxfToDwg(
+                dxfPath: dxfPath,
+                outputDwgPath: sourcePath,
+              );
+              await log.info('已回写 DWG: $sourcePath', context: 'dxf');
+            } else {
+              final outputDwgPath = _resolveOutputPath(
+                sourcePath,
+                preferredExtension: '.dwg',
+                usedPaths: usedOutputPaths,
+              );
+              final outputParent = Directory(p.dirname(outputDwgPath));
+              if (!outputParent.existsSync()) {
+                outputParent.createSync(recursive: true);
+              }
+
+              final tempDir = await Directory.systemTemp.createTemp(
+                'office_toolbox_replace_',
+              );
+              final tempDxfPath = p.join(
+                tempDir.path,
+                '${p.basenameWithoutExtension(sourcePath)}_replace_tmp.dxf',
+              );
+              try {
+                await File(tempDxfPath).writeAsString(updatedText, flush: true);
+                await cache.convertDxfToDwg(
+                  dxfPath: tempDxfPath,
+                  outputDwgPath: outputDwgPath,
+                );
+              } finally {
+                if (tempDir.existsSync()) {
+                  tempDir.deleteSync(recursive: true);
+                }
+              }
+              usedOutputPaths.add(_normalizePathKey(outputDwgPath));
+              await log.info('已输出 DWG: $outputDwgPath', context: 'dxf');
+            }
+          } else {
+            final outputPath = _resolveOutputPath(
+              sourcePath,
+              preferredExtension: '.dxf',
+              usedPaths: usedOutputPaths,
+            );
+            final outputFile = File(outputPath);
+            final parent = outputFile.parent;
+            if (!parent.existsSync()) {
+              parent.createSync(recursive: true);
+            }
+            await outputFile.writeAsString(updatedText, flush: true);
+            usedOutputPaths.add(_normalizePathKey(outputPath));
+            await log.info('已写入 DXF: $outputPath', context: 'dxf');
+          }
+          written++;
+        } catch (error) {
+          failed++;
+          await log.error(
+            '写入失败: ${p.basename(dxfPath)}',
+            context: 'dxf',
+            error: error,
+          );
+        }
       }
       context.updateProgress(1, message: '完成');
+      return _ApplySummary(written: written, skipped: skipped, failed: failed);
     });
 
     if (!mounted) return;
 
+    if (summary == null) {
+      setState(() {
+        _isRunning = false;
+        _status = '替换未完成，请查看日志';
+      });
+      return;
+    }
+
     setState(() {
       _isRunning = false;
       _progress = 1;
-      _status = '替换完成';
+      final tail = summary.failed > 0 || summary.skipped > 0
+          ? '（成功 ${summary.written}，跳过 ${summary.skipped}，失败 ${summary.failed}）'
+          : '（成功 ${summary.written}）';
+      if (_overwrite) {
+        _status = '替换完成，已覆盖写入 DWG/DXF $tail';
+      } else if (_outputDir != null) {
+        _status = '替换完成，已输出到 ${_outputDir} $tail';
+      } else {
+        _status = '替换完成，已输出到源目录 $tail';
+      }
     });
   }
 
-  String _resolveOutputPath(String inputPath) {
+  String _resolveOutputPath(
+    String inputPath, {
+    String? preferredExtension,
+    Set<String>? usedPaths,
+  }) {
     if (_overwrite) return inputPath;
-    if (_outputDir != null) {
-      return p.join(_outputDir!, p.basename(inputPath));
-    }
-    final dir = p.dirname(inputPath);
+
+    final outputDir = _outputDir ?? p.dirname(inputPath);
     final base = p.basenameWithoutExtension(inputPath);
-    return p.join(dir, '${base}_replaced.dxf');
+    final ext =
+        preferredExtension ??
+        (p.extension(inputPath).isEmpty ? '.dxf' : p.extension(inputPath));
+
+    String buildPath(int? suffix) {
+      final tail = suffix == null ? '_replaced' : '_replaced_${suffix}';
+      return p.join(outputDir, '${base}${tail}${ext}');
+    }
+
+    var candidate = buildPath(null);
+    if (usedPaths == null) {
+      return candidate;
+    }
+
+    var key = _normalizePathKey(candidate);
+    if (!usedPaths.contains(key) && !File(candidate).existsSync()) {
+      return candidate;
+    }
+
+    var seq = 2;
+    while (true) {
+      candidate = buildPath(seq);
+      key = _normalizePathKey(candidate);
+      if (!usedPaths.contains(key) && !File(candidate).existsSync()) {
+        return candidate;
+      }
+      seq++;
+    }
+  }
+
+  String _normalizePathKey(String inputPath) {
+    return p.normalize(inputPath).toLowerCase();
+  }
+
+  String _outputModeLabel() {
+    if (_overwrite) {
+      return '覆盖原文件';
+    }
+    if (_outputDir == null) {
+      return '输出到源目录';
+    }
+    return '输出目录: ${_outputDir}';
   }
 
   Future<void> _exportCsv() async {
@@ -379,7 +626,16 @@ class _DxfReplaceTabState extends State<DxfReplaceTab> {
       suggestedName: '替换结果.csv',
       headers: const ['文件名', '对象类型', '图层', '原内容', '替换后', '使用规则'],
       rows: _results
-          .map((r) => [r.fileName, r.objectType, r.layer, r.originalText, r.updatedText, r.rule])
+          .map(
+            (r) => [
+              r.fileName,
+              r.objectType,
+              r.layer,
+              r.originalText,
+              r.updatedText,
+              r.rule,
+            ],
+          )
           .toList(),
     );
   }
@@ -392,30 +648,45 @@ class _DxfReplaceTabState extends State<DxfReplaceTab> {
       sheetName: '替换结果',
       headers: const ['文件名', '对象类型', '图层', '原内容', '替换后', '使用规则'],
       rows: _results
-          .map((r) => [r.fileName, r.objectType, r.layer, r.originalText, r.updatedText, r.rule])
+          .map(
+            (r) => [
+              r.fileName,
+              r.objectType,
+              r.layer,
+              r.originalText,
+              r.updatedText,
+              r.rule,
+            ],
+          )
           .toList(),
     );
   }
 
   void _showSnack(String message) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message)),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   List<DxfReplaceResult> get _filteredResults {
     return _results.where((item) {
       if (_filterFile.isNotEmpty && item.fileName != _filterFile) return false;
-      if (_filterType.isNotEmpty && item.objectType != _filterType) return false;
+      if (_filterType.isNotEmpty && item.objectType != _filterType)
+        return false;
       if (_filterLayer.isNotEmpty && item.layer != _filterLayer) return false;
-      if (_filterRule.isNotEmpty && !item.rule.contains(_filterRule)) return false;
+      if (_filterRule.isNotEmpty && !item.rule.contains(_filterRule))
+        return false;
       if (_filterOriginal.isNotEmpty &&
-          !item.originalText.toLowerCase().contains(_filterOriginal.toLowerCase())) {
+          !item.originalText.toLowerCase().contains(
+            _filterOriginal.toLowerCase(),
+          )) {
         return false;
       }
       if (_filterUpdated.isNotEmpty &&
-          !item.updatedText.toLowerCase().contains(_filterUpdated.toLowerCase())) {
+          !item.updatedText.toLowerCase().contains(
+            _filterUpdated.toLowerCase(),
+          )) {
         return false;
       }
       return true;
@@ -468,7 +739,9 @@ class _DxfReplaceTabState extends State<DxfReplaceTab> {
                     onDragExited: (_) => setState(() => _isDragging = false),
                     onDragDone: (detail) async {
                       setState(() => _isDragging = false);
-                      await _handleDrop(detail.files.map((file) => file.path).toList());
+                      await _handleDrop(
+                        detail.files.map((file) => file.path).toList(),
+                      );
                     },
                     child: Container(
                       width: double.infinity,
@@ -502,8 +775,10 @@ class _DxfReplaceTabState extends State<DxfReplaceTab> {
                                 icon: const Icon(Icons.folder_open),
                                 label: const Text('选择文件夹'),
                               ),
-                              Text('支持拖拽文件或文件夹到此区域',
-                                  style: theme.textTheme.bodySmall),
+                              Text(
+                                '支持拖拽文件或文件夹到此区域',
+                                style: theme.textTheme.bodySmall,
+                              ),
                             ],
                           ),
                         ],
@@ -525,7 +800,9 @@ class _DxfReplaceTabState extends State<DxfReplaceTab> {
                           children: [
                             Text(
                               '已上传文件 (${_files.length})',
-                              style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w600),
+                              style: theme.textTheme.titleSmall?.copyWith(
+                                fontWeight: FontWeight.w600,
+                              ),
                             ),
                             const Spacer(),
                             TextButton.icon(
@@ -540,7 +817,10 @@ class _DxfReplaceTabState extends State<DxfReplaceTab> {
                           height: 180,
                           child: _files.isEmpty
                               ? Center(
-                                  child: Text('暂无文件', style: theme.textTheme.bodySmall),
+                                  child: Text(
+                                    '暂无文件',
+                                    style: theme.textTheme.bodySmall,
+                                  ),
                                 )
                               : Scrollbar(
                                   controller: _fileScrollController,
@@ -548,15 +828,23 @@ class _DxfReplaceTabState extends State<DxfReplaceTab> {
                                   child: ListView.separated(
                                     controller: _fileScrollController,
                                     itemCount: _files.length,
-                                    separatorBuilder: (_, __) => const Divider(height: 1),
+                                    separatorBuilder: (_, __) =>
+                                        const Divider(height: 1),
                                     itemBuilder: (context, index) {
                                       final file = _files[index];
                                       final path = file.path ?? '';
                                       return ListTile(
                                         dense: true,
                                         visualDensity: VisualDensity.compact,
-                                        leading: const Icon(Icons.description_outlined, size: 20),
-                                        title: Text(file.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+                                        leading: const Icon(
+                                          Icons.description_outlined,
+                                          size: 20,
+                                        ),
+                                        title: Text(
+                                          file.name,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
                                         subtitle: path.isEmpty
                                             ? null
                                             : Text(
@@ -591,20 +879,29 @@ class _DxfReplaceTabState extends State<DxfReplaceTab> {
                             Expanded(
                               child: TextField(
                                 controller: row.findController,
-                                decoration: const InputDecoration(labelText: '查找内容'),
+                                decoration: const InputDecoration(
+                                  labelText: '查找内容',
+                                ),
                               ),
                             ),
                             const SizedBox(width: 8),
                             Expanded(
                               child: TextField(
                                 controller: row.replaceController,
-                                decoration: const InputDecoration(labelText: '替换为'),
+                                decoration: const InputDecoration(
+                                  labelText: '替换为',
+                                ),
                               ),
                             ),
                             const SizedBox(width: 8),
                             IconButton(
-                              onPressed: () => index == 0 ? _addPair() : _removePair(index),
-                              icon: Icon(index == 0 ? Icons.add_circle : Icons.remove_circle),
+                              onPressed: () =>
+                                  index == 0 ? _addPair() : _removePair(index),
+                              icon: Icon(
+                                index == 0
+                                    ? Icons.add_circle
+                                    : Icons.remove_circle,
+                              ),
                             ),
                           ],
                         ),
@@ -618,7 +915,9 @@ class _DxfReplaceTabState extends State<DxfReplaceTab> {
                     crossAxisAlignment: WrapCrossAlignment.center,
                     children: [
                       FilledButton.icon(
-                        onPressed: _results.isEmpty || _isRunning ? null : _applyReplace,
+                        onPressed: _results.isEmpty || _isRunning
+                            ? null
+                            : _applyReplace,
                         icon: const Icon(Icons.check_circle),
                         label: const Text('确认替换'),
                       ),
@@ -637,7 +936,8 @@ class _DxfReplaceTabState extends State<DxfReplaceTab> {
                         children: [
                           Checkbox(
                             value: _overwrite,
-                            onChanged: (value) => setState(() => _overwrite = value ?? false),
+                            onChanged: (value) =>
+                                setState(() => _overwrite = value ?? false),
                           ),
                           const Text('覆盖原文件'),
                         ],
@@ -649,6 +949,8 @@ class _DxfReplaceTabState extends State<DxfReplaceTab> {
                       ),
                     ],
                   ),
+                  const SizedBox(height: 6),
+                  Text(_outputModeLabel(), style: theme.textTheme.bodySmall),
                   const SizedBox(height: 12),
                   if (_isRunning) ...[
                     LinearProgressIndicator(value: _progress),
@@ -670,33 +972,51 @@ class _DxfReplaceTabState extends State<DxfReplaceTab> {
                       runSpacing: 12,
                       children: [
                         _buildDropdown('文件', files, _filterFile, (value) {
-                          setState(() => _filterFile = value == '全部' ? '' : value ?? '');
+                          setState(
+                            () =>
+                                _filterFile = value == '全部' ? '' : value ?? '',
+                          );
                         }),
                         _buildDropdown('类型', types, _filterType, (value) {
-                          setState(() => _filterType = value == '全部' ? '' : value ?? '');
+                          setState(
+                            () =>
+                                _filterType = value == '全部' ? '' : value ?? '',
+                          );
                         }),
                         _buildDropdown('图层', layers, _filterLayer, (value) {
-                          setState(() => _filterLayer = value == '全部' ? '' : value ?? '');
+                          setState(
+                            () =>
+                                _filterLayer = value == '全部' ? '' : value ?? '',
+                          );
                         }),
                         SizedBox(
                           width: 220,
                           child: TextField(
-                            decoration: const InputDecoration(labelText: '原内容过滤'),
-                            onChanged: (value) => setState(() => _filterOriginal = value.trim()),
+                            decoration: const InputDecoration(
+                              labelText: '原内容过滤',
+                            ),
+                            onChanged: (value) =>
+                                setState(() => _filterOriginal = value.trim()),
                           ),
                         ),
                         SizedBox(
                           width: 220,
                           child: TextField(
-                            decoration: const InputDecoration(labelText: '替换后过滤'),
-                            onChanged: (value) => setState(() => _filterUpdated = value.trim()),
+                            decoration: const InputDecoration(
+                              labelText: '替换后过滤',
+                            ),
+                            onChanged: (value) =>
+                                setState(() => _filterUpdated = value.trim()),
                           ),
                         ),
                         SizedBox(
                           width: 220,
                           child: TextField(
-                            decoration: const InputDecoration(labelText: '规则过滤'),
-                            onChanged: (value) => setState(() => _filterRule = value.trim()),
+                            decoration: const InputDecoration(
+                              labelText: '规则过滤',
+                            ),
+                            onChanged: (value) =>
+                                setState(() => _filterRule = value.trim()),
                           ),
                         ),
                         OutlinedButton.icon(
@@ -772,12 +1092,7 @@ class _DxfReplaceTabState extends State<DxfReplaceTab> {
             value: value.isEmpty ? '全部' : value,
             isDense: true,
             items: items
-                .map(
-                  (item) => DropdownMenuItem(
-                    value: item,
-                    child: Text(item),
-                  ),
-                )
+                .map((item) => DropdownMenuItem(value: item, child: Text(item)))
                 .toList(),
             onChanged: onChanged,
           ),
@@ -828,8 +1143,8 @@ class _ReplaceDataSource extends DataTableSource {
 
 class _PairRow {
   _PairRow()
-      : findController = TextEditingController(),
-        replaceController = TextEditingController();
+    : findController = TextEditingController(),
+      replaceController = TextEditingController();
 
   final TextEditingController findController;
   final TextEditingController replaceController;

@@ -166,6 +166,31 @@ CREATE TABLE IF NOT EXISTS dxf_text (
     _dbPath = null;
   }
 
+  @visibleForTesting
+  String buildOdaProcessCommandForTest(
+    String exe,
+    List<String> args, {
+    String? expectedOutputPath,
+    int timeoutSeconds = 90,
+  }) {
+    return _buildOdaProcessCommand(
+      exe,
+      args,
+      expectedOutputPath,
+      timeoutSeconds,
+    );
+  }
+
+  @visibleForTesting
+  String toLegacyVersionForTest(String outputVersion) {
+    return _toLegacyVersion(outputVersion);
+  }
+
+  @visibleForTesting
+  Future<void> waitForFileReadyForTest(String path) {
+    return _waitForFileReady(path);
+  }
+
   Future<List<DxfPreparedFile>> prepareSources(
     List<PlatformFile> sources,
     TaskContext context, {
@@ -211,6 +236,7 @@ CREATE TABLE IF NOT EXISTS dxf_text (
         sourceMtime: sourceMtime,
         meta: meta,
         context: context,
+        baseProgress: progress,
       );
 
       if (outputInfo == null) {
@@ -425,6 +451,7 @@ CREATE TABLE IF NOT EXISTS dxf_text (
     required int sourceMtime,
     required Map<String, Object?>? meta,
     required TaskContext context,
+    required double baseProgress,
   }) async {
     final isDxf = ext == '.dxf';
     final isDwg = ext == '.dwg';
@@ -499,7 +526,10 @@ CREATE TABLE IF NOT EXISTS dxf_text (
       }
 
       if (needsConvert) {
+        context.updateProgress(baseProgress, message: '转换 DWG: $sourceName');
+        await _log.info('开始转换 DWG -> DXF: $sourcePath', context: 'dxf');
         await _convertDwgToDxf(sourcePath, p.dirname(dxfPath));
+        await _log.info('完成转换 DWG -> DXF: $sourcePath', context: 'dxf');
         dxfFile = File(dxfPath);
         if (!dxfFile.existsSync()) {
           final alt = _findDxfByBasename(
@@ -522,6 +552,7 @@ CREATE TABLE IF NOT EXISTS dxf_text (
       await _log.error('DXF 文件不存在: $dxfPath', context: 'dxf');
       return null;
     }
+    await _waitForFileReady(dxfPath);
 
     final dxfStat = dxfFile.statSync();
     final dxfSize = dxfStat.size;
@@ -531,6 +562,7 @@ CREATE TABLE IF NOT EXISTS dxf_text (
     final metaDxfMtime = meta?['dxf_mtime'] as int?;
     final metaDxfMd5 = meta?['dxf_md5'] as String?;
     if (meta == null || metaDxfSize != dxfSize || metaDxfMtime != dxfMtime) {
+      await _waitForFileReady(dxfPath);
       dxfMd5 = await _computeFileMd5(dxfPath);
     }
 
@@ -672,12 +704,12 @@ CREATE TABLE IF NOT EXISTS dxf_text (
           'VALUES (?, ?, ?, ?, ?, ?)',
         );
         for (final item in items) {
-          final content = item['content'] as String? ?? '';
+          final content = item['content'] ?? '';
           stmt.execute([
             file.sourcePath,
-            item['fileName'] as String? ?? '',
-            item['objectType'] as String? ?? '',
-            item['layer'] as String? ?? '',
+            item['fileName'] ?? '',
+            item['objectType'] ?? '',
+            item['layer'] ?? '',
             content,
             content.toLowerCase(),
           ]);
@@ -707,7 +739,76 @@ CREATE TABLE IF NOT EXISTS dxf_text (
     return compute(_md5Worker, path);
   }
 
+  Future<String> convertDxfToDwg({
+    required String dxfPath,
+    required String outputDwgPath,
+  }) async {
+    final sourceFile = File(dxfPath);
+    if (!sourceFile.existsSync()) {
+      throw Exception('DXF 文件不存在: $dxfPath');
+    }
+
+    final normalizedOutput = p.normalize(outputDwgPath);
+    final outputDir = p.dirname(normalizedOutput);
+    final outputFolder = Directory(outputDir);
+    if (!outputFolder.existsSync()) {
+      outputFolder.createSync(recursive: true);
+    }
+
+    final generatedPath = p.join(
+      outputDir,
+      '${p.basenameWithoutExtension(dxfPath)}.dwg',
+    );
+    await _convertWithOda(
+      inputPath: dxfPath,
+      outputDir: outputDir,
+      inputType: 'DXF',
+      outputType: 'DWG',
+      outputVersion: 'DWG2010',
+    );
+
+    final generatedFile = File(generatedPath);
+    if (!generatedFile.existsSync()) {
+      throw Exception('DXF 转 DWG 后未找到输出文件: $generatedPath');
+    }
+
+    final generatedNorm = p.normalize(generatedPath).toLowerCase();
+    final targetNorm = normalizedOutput.toLowerCase();
+    if (generatedNorm == targetNorm) {
+      return normalizedOutput;
+    }
+
+    final targetFile = File(normalizedOutput);
+    if (targetFile.existsSync()) {
+      targetFile.deleteSync();
+    }
+
+    try {
+      generatedFile.renameSync(normalizedOutput);
+    } catch (_) {
+      generatedFile.copySync(normalizedOutput);
+      generatedFile.deleteSync();
+    }
+    return normalizedOutput;
+  }
+
   Future<void> _convertDwgToDxf(String dwgPath, String outputDir) async {
+    await _convertWithOda(
+      inputPath: dwgPath,
+      outputDir: outputDir,
+      inputType: 'DWG',
+      outputType: 'DXF',
+      outputVersion: 'DXF2010',
+    );
+  }
+
+  Future<void> _convertWithOda({
+    required String inputPath,
+    required String outputDir,
+    required String inputType,
+    required String outputType,
+    required String outputVersion,
+  }) async {
     final exe = _resolveOdaExecutable();
     if (exe == null) {
       throw Exception('未找到 ODAFileConverter，请检查 ODAFileConverter 文件夹');
@@ -718,35 +819,120 @@ CREATE TABLE IF NOT EXISTS dxf_text (
     }
     await _hideOutputDir(outputDir);
 
-    final inputDir = p.dirname(dwgPath);
-    final args = [
-      inputDir,
-      outputDir,
-      'ACAD2010',
-      'DXF',
-      '0',
-      '0',
-      p.basename(dwgPath),
+    final normalizedOutputType = outputType.toUpperCase();
+    final normalizedOutputVersion = outputVersion.toUpperCase();
+    final legacyVersion = _toLegacyVersion(normalizedOutputVersion);
+    final expectedExt = normalizedOutputType.toLowerCase();
+    final expectedBase = p.basenameWithoutExtension(inputPath);
+    final expectedPath = p.join(outputDir, '$expectedBase.$expectedExt');
+
+    final attempts = <({String label, List<String> args})>[
+      (
+        label: 'legacy',
+        args: [
+          p.dirname(inputPath),
+          outputDir,
+          legacyVersion,
+          normalizedOutputType,
+          '0',
+          '0',
+          p.basename(inputPath),
+        ],
+      ),
     ];
 
-    final result = await _runOda(exe, args);
-    if (result.exitCode != 0) {
-      await _log.error(
-        'ODA 转换失败: $dwgPath',
-        context: 'dxf',
-        error: '${result.stderr}'.trim().isEmpty
-            ? result.stdout
-            : result.stderr,
+    final odaTimeout = _odaTimeoutForInput(inputPath);
+    final errors = <String>[];
+    for (final attempt in attempts) {
+      final result = await _runOda(
+        exe,
+        attempt.args,
+        expectedOutputPath: expectedPath,
+        timeout: odaTimeout,
       );
-      throw Exception('ODA 转换失败');
+      if (result.exitCode != 0) {
+        errors.add(
+          '${attempt.label}: ${_formatOdaError(result)} | args=${attempt.args.join(' | ')}',
+        );
+        continue;
+      }
+
+      final expectedFile = File(expectedPath);
+      if (expectedFile.existsSync()) {
+        return;
+      }
+      final altPath = _findOutputByBasename(
+        outputDir,
+        expectedBase,
+        expectedExt,
+      );
+      if (altPath != null) {
+        return;
+      }
+
+      errors.add(
+        '${attempt.label}: exit=0 但未找到输出文件 $expectedPath | args=${attempt.args.join(' | ')}',
+      );
+    }
+
+    await _log.error(
+      'ODA 转换失败: $inputPath',
+      context: 'dxf',
+      error: '可执行文件: $exe; ${errors.join(' || ')}',
+    );
+    throw Exception('ODA 转换失败');
+  }
+
+  String _toLegacyVersion(String outputVersion) {
+    final upper = outputVersion.toUpperCase();
+    if (upper.startsWith('ACAD')) {
+      return upper;
+    }
+    final match = RegExp(r'(DWG|DXF)(\d{4})').firstMatch(upper);
+    if (match != null) {
+      return 'ACAD${match.group(2)}';
+    }
+    return 'ACAD2010';
+  }
+
+  String _formatOdaError(ProcessResult result) {
+    final stderr = '${result.stderr}'.trim();
+    if (stderr.isNotEmpty) {
+      return 'exit=${result.exitCode}, stderr=$stderr';
+    }
+    final stdout = '${result.stdout}'.trim();
+    if (stdout.isNotEmpty) {
+      return 'exit=${result.exitCode}, stdout=$stdout';
+    }
+    return 'exit=${result.exitCode}';
+  }
+
+  Duration _odaTimeoutForInput(String inputPath) {
+    try {
+      final bytes = File(inputPath).lengthSync();
+      final mb = bytes / (1024 * 1024);
+      final seconds = (60 + mb * 3).round().clamp(90, 900);
+      return Duration(seconds: seconds);
+    } catch (_) {
+      return const Duration(minutes: 3);
     }
   }
 
-  Future<ProcessResult> _runOda(String exe, List<String> args) async {
+  Future<ProcessResult> _runOda(
+    String exe,
+    List<String> args, {
+    String? expectedOutputPath,
+    Duration timeout = const Duration(minutes: 3),
+  }) async {
     if (!Platform.isWindows) {
       return Process.run(exe, args, runInShell: false);
     }
-    final command = _buildHiddenStartProcessCommand(exe, args);
+    final command = _buildOdaProcessCommand(
+      exe,
+      args,
+      expectedOutputPath,
+      timeout.inSeconds,
+    );
     return Process.run('powershell', [
       '-NoProfile',
       '-NonInteractive',
@@ -755,13 +941,48 @@ CREATE TABLE IF NOT EXISTS dxf_text (
     ], runInShell: false);
   }
 
-  String _buildHiddenStartProcessCommand(String exe, List<String> args) {
-    String escape(String value) => value.replaceAll("'", "''");
-    final quotedArgs = args.map((arg) => "'${escape(arg)}'").join(', ');
-    final argList = quotedArgs.isEmpty ? '@()' : '@($quotedArgs)';
-    final filePath = "'${escape(exe)}'";
-    return '\$p = Start-Process -FilePath $filePath -ArgumentList $argList '
-        '-WindowStyle Hidden -Wait -PassThru; exit \$p.ExitCode';
+  String _buildOdaProcessCommand(
+    String exe,
+    List<String> args,
+    String? expectedOutputPath,
+    int timeoutSeconds,
+  ) {
+    String escapePsSingleQuoted(String value) => value.replaceAll("'", "''");
+    String quoteWinArg(String value) {
+      final escaped = value.replaceAll('"', r'\"');
+      return '"$escaped"';
+    }
+
+    final argLine = args.map(quoteWinArg).join(' ');
+    final filePath = "'${escapePsSingleQuoted(exe)}'";
+    final quotedArgLine = "'${escapePsSingleQuoted(argLine)}'";
+    final timeout = timeoutSeconds < 5 ? 5 : timeoutSeconds;
+    final timeoutOutputCheck =
+        expectedOutputPath == null
+        ? ''
+        : '''
+if (Test-Path -LiteralPath '${escapePsSingleQuoted(expectedOutputPath)}') {
+  Write-Error "ODA process timeout (output exists but process is still running)"
+  exit 124
+}
+''';
+    return '''
+\$p = Start-Process -FilePath $filePath -ArgumentList $quotedArgLine -WindowStyle Hidden -PassThru
+\$deadline = (Get-Date).AddSeconds($timeout)
+while ((Get-Date) -lt \$deadline) {
+  \$p.Refresh()
+  if (\$p.HasExited) {
+    exit \$p.ExitCode
+  }
+  Start-Sleep -Milliseconds 300
+}
+if (-not \$p.HasExited) {
+  Stop-Process -Id \$p.Id -Force -ErrorAction SilentlyContinue
+}
+$timeoutOutputCheck
+Write-Error "ODA process timeout"
+exit 124
+''';
   }
 
   String? _resolveOdaExecutable() {
@@ -826,15 +1047,51 @@ CREATE TABLE IF NOT EXISTS dxf_text (
     }
   }
 
+  Future<void> _waitForFileReady(String path) async {
+    final file = File(path);
+    if (!file.existsSync()) {
+      return;
+    }
+
+    final deadline = DateTime.now().add(const Duration(seconds: 12));
+    int? lastSize;
+    while (true) {
+      if (!file.existsSync()) {
+        return;
+      }
+      try {
+        final raf = file.openSync(mode: FileMode.read);
+        final size = raf.lengthSync();
+        raf.closeSync();
+        if (size > 0 && lastSize != null && size == lastSize) {
+          return;
+        }
+        lastSize = size;
+      } on FileSystemException {
+        // DXF may still be locked by converter; retry briefly.
+      }
+
+      if (DateTime.now().isAfter(deadline)) {
+        return;
+      }
+      await Future.delayed(const Duration(milliseconds: 250));
+    }
+  }
+
   String? _findDxfByBasename(String dir, String baseName) {
+    return _findOutputByBasename(dir, baseName, 'dxf');
+  }
+
+  String? _findOutputByBasename(String dir, String baseName, String ext) {
     final folder = Directory(dir);
     if (!folder.existsSync()) return null;
     final lowerBase = baseName.toLowerCase();
+    final expectedExt = '.${ext.toLowerCase()}';
     for (final entity in folder.listSync()) {
       if (entity is! File) continue;
       final name = p.basenameWithoutExtension(entity.path).toLowerCase();
       if (name == lowerBase &&
-          p.extension(entity.path).toLowerCase() == '.dxf') {
+          p.extension(entity.path).toLowerCase() == expectedExt) {
         return entity.path;
       }
     }

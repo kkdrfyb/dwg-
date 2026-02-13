@@ -1,42 +1,92 @@
-# Office Toolbox
+# 办公工具箱（Flutter 版）使用说明
 
-Flutter rebuild of the Office Toolbox app.
+本程序支持 Excel 与 CAD（DWG/DXF）的本地批量处理，离线可用。
 
-## Quick Start
+## 快速开始
+
+1. 双击 `office_toolbox_flutter.exe` 启动。
+2. 在左侧切到对应模块（Excel 或 CAD）。
+3. 选择文件 / 文件夹，设置参数后点击 `开始处理`。
+4. 结果可导出为 CSV / Excel，或按功能生成结果文件。
+
+## Excel 功能总览
+
+| 功能 | 说明 | 简单演示 |
+| --- | --- | --- |
+| 多工作簿 -> 工作簿 | 将多个文件的所有工作表复制到一个新工作簿，并生成索引表 | 门店A.xlsx + 门店B.xlsx -> 门店A-1月份、门店B-1月份... |
+| 多工作簿 -> 工作表 | 将多个文件数据提取到一个工作表，支持表头/表尾控制 | 两份月报纵向叠加为一张“汇总结果”表 |
+| 工作簿内部汇总 | 对每个工作簿内部多工作表执行提取合并 | 门店A.xlsx 的 1月份+2月份 -> 全工作簿汇总 |
+| 调整字段名的列号 | 按目标字段顺序重排列，支持字段别名映射 | 目标顺序=品名,价格,数量；商品名=品名 |
+| 拆分工作簿 | 按工作表拆分，一个工作表输出一个文件 | 门店A.xlsx -> 门店A-1月份.xlsx、门店A-2月份.xlsx |
+| 拆分工作表 | 按字段值拆分，支持一个文件多表或多个文件 | 按“水果名”拆分 -> 苹果表、西瓜表 |
+| 同名表重组到一簿 | 将多个文件同名工作表重组为独立工作簿 | 所有“1月份”重组为 1月份.xlsx |
+| 多工作簿汇总到一簿 | 跨文件跨表做聚合汇总（自动识别数值列求和） | 按“品名”汇总销量，输出总值与明细 |
+| 一簿汇总到一表 | 对单个工作簿内部多表做聚合汇总，生成汇总表 | 门店A.xlsx 多月明细按品名汇总 |
+| 同名 Sheet 提取 | 跨文件按同名表执行提取合并 | 所有文件的“1月份”提取到结果“1月份” |
+| 同名 Sheet 汇总 | 跨文件按同名表执行聚合汇总 | 所有“1月份”汇总后输出“1月份”结果表 |
+| 同位置提取到一表 | 按指定单元格位置提取值；为空则提取首表内容 | 提取 A1,H1,H2 -> 清单表 |
+| 同位置汇总到一表 | 按指定位置做汇总（数值求和，文本拼接） | H1 汇总总营业额，A1 汇总店名 |
+| 同名文件汇总 | 面向同名文件场景，可重命名或跳过重复表名 | 不同目录同名文件统一汇总并保留索引 |
+| 合并动态字段 | 动态字段合并，自动对齐列；支持别名和顺序 | 人民币价格/美元价格合并到同一结果表 |
+
+## 字段别名与顺序规则
+
+适用功能：`调整字段名的列号`、`合并动态字段`。
+
+1. 目标字段顺序：用逗号分隔  
+示例：`品名,价格,数量,厂家,备注`
+
+2. 字段别名映射：每行一条，格式 `原字段=目标字段`  
+示例：
+
+```txt
+商品名=品名
+单价=价格
+库存数=数量
+```
+
+## 输出与命名
+
+1. 单文件结果：弹出“保存文件”对话框选择路径。
+2. 多文件结果：弹出“选择目录”对话框，批量写入该目录。
+3. 同名冲突：程序会自动追加序号避免覆盖。
+
+## CAD 模块说明（简要）
+
+1. DWG 关键字查找：批量扫描文字并支持筛选导出。
+2. 阀门/风口统计：识别图纸中的设备信息并导出。
+3. 图纸文字替换：支持模拟预览、批量写入、DWG 回写。
+
+## 日志位置
+
+Windows 默认日志文件：
+
+`C:\Users\<用户名>\AppData\Roaming\Office Toolbox\Office Toolbox\office_toolbox\logs\office_toolbox.log`
+
+## 开发者构建（可选）
 
 ```bash
 flutter pub get
 flutter run
+flutter build windows --release
 ```
 
-## Android Release Build
+## 开发测试程序（每次修改后执行）
 
-1. Update `namespace` and `applicationId` in `android/app/build.gradle.kts` to your own unique package name.
-2. Create a keystore and signing config:
+PowerShell：
 
-```bash
-# Run from the android directory
-mkdir keystore
-keytool -genkeypair -v -keystore keystore/office_toolbox.jks -keyalg RSA -keysize 2048 -validity 10000 -alias office_toolbox
+```powershell
+.\tool\run_tests.ps1
 ```
 
-3. Copy `android/key.properties.example` to `android/key.properties` and fill in:
+或双击/命令行运行：
 
-```properties
-storeFile=../keystore/office_toolbox.jks
-storePassword=YOUR_STORE_PASSWORD
-keyAlias=office_toolbox
-keyPassword=YOUR_KEY_PASSWORD
+```bat
+tool\run_tests.bat
 ```
 
-4. Build release artifacts:
+脚本会依次执行：
 
-```bash
-flutter build apk --release
-# or
-flutter build appbundle --release
-```
-
-Notes:
-- If `android/key.properties` is missing, the build falls back to debug signing for local testing.
-- For production distribution, always use a real release keystore.
+1. `flutter pub get`
+2. `flutter analyze`
+3. `flutter test`

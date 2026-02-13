@@ -1,7 +1,7 @@
 import 'dart:io';
 import 'dart:math';
 
-import 'package:excel/excel.dart';
+import 'package:excel/excel.dart' hide Border;
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
@@ -13,6 +13,76 @@ import '../../widgets/section_card.dart';
 import 'excel_isolate.dart';
 import 'excel_models.dart';
 
+class _ExcelModeGuide {
+  const _ExcelModeGuide({required this.description, required this.demo});
+
+  final String description;
+  final String demo;
+}
+
+const Map<ExcelMode, _ExcelModeGuide> _excelModeGuides = {
+  ExcelMode.mergeWorkbooks: _ExcelModeGuide(
+    description: '将多个文件的所有工作表复制到一个新工作簿，并生成索引表。',
+    demo: '示例：门店A.xlsx + 门店B.xlsx -> 输出工作表：门店A-1月份、门店B-1月份...',
+  ),
+  ExcelMode.mergeToSheet: _ExcelModeGuide(
+    description: '将多个工作簿的数据提取到一个工作表，支持表头/表尾控制。',
+    demo: '示例：两份月报纵向叠加为一张“汇总结果”表。',
+  ),
+  ExcelMode.internalMerge: _ExcelModeGuide(
+    description: '对每个工作簿内部多工作表执行提取合并。',
+    demo: '示例：门店A.xlsx 的 1月份+2月份 -> 全工作簿汇总。',
+  ),
+  ExcelMode.reorderColumns: _ExcelModeGuide(
+    description: '按目标字段顺序重排列，并支持字段别名映射。',
+    demo: '示例：字段顺序=品名,价格,数量；别名“商品名=品名”。',
+  ),
+  ExcelMode.splitWorkbook: _ExcelModeGuide(
+    description: '按工作表拆分工作簿，每个工作表输出一个文件。',
+    demo: '示例：门店A.xlsx -> 门店A-1月份.xlsx、门店A-2月份.xlsx。',
+  ),
+  ExcelMode.splitWorksheet: _ExcelModeGuide(
+    description: '按某列字段值拆分明细，可输出为一个文件多表或多个文件。',
+    demo: '示例：按“水果名”拆分 -> 苹果表、西瓜表。',
+  ),
+  ExcelMode.regroupSameSheetToWorkbook: _ExcelModeGuide(
+    description: '将多个文件的同名工作表重组为单独工作簿。',
+    demo: '示例：A/B 文件都有“1月份” -> 输出 1月份.xlsx（内含门店A、门店B表）。',
+  ),
+  ExcelMode.mergeToSheetSummary: _ExcelModeGuide(
+    description: '跨文件跨表做字段聚合汇总（自动识别数值列求和）。',
+    demo: '示例：按“品名”汇总，得到销量总和与明细。',
+  ),
+  ExcelMode.internalSummary: _ExcelModeGuide(
+    description: '对单个工作簿内部多表做聚合汇总，生成“汇总表”。',
+    demo: '示例：门店A.xlsx 的多月明细按品名汇总到一表。',
+  ),
+  ExcelMode.sameNameSheet: _ExcelModeGuide(
+    description: '跨文件按同名工作表执行提取合并。',
+    demo: '示例：所有文件的“1月份”提取到结果中的“1月份”表。',
+  ),
+  ExcelMode.sameNameSheetSummary: _ExcelModeGuide(
+    description: '跨文件按同名工作表执行聚合汇总。',
+    demo: '示例：所有“1月份”表汇总后输出“1月份”结果表。',
+  ),
+  ExcelMode.samePosition: _ExcelModeGuide(
+    description: '按指定单元格位置提取值；为空则提取首表内容。',
+    demo: '示例：提取 A1,H1,H2 -> 形成清单表。',
+  ),
+  ExcelMode.samePositionSummary: _ExcelModeGuide(
+    description: '按指定位置做汇总（数值求和，文本去重拼接）。',
+    demo: '示例：H1 汇总总营业额，A1 汇总店名列表。',
+  ),
+  ExcelMode.sameFilename: _ExcelModeGuide(
+    description: '将同名文件场景汇总到一个工作簿，可重命名或跳过重复表名。',
+    demo: '示例：不同目录同名文件统一汇总并保留索引。',
+  ),
+  ExcelMode.mergeDynamic: _ExcelModeGuide(
+    description: '动态字段合并，自动对齐列；支持别名映射和目标字段顺序。',
+    demo: '示例：人民币价格/美元价格合并到同一结果表。',
+  ),
+};
+
 class ExcelPage extends StatefulWidget {
   const ExcelPage({super.key});
 
@@ -22,16 +92,30 @@ class ExcelPage extends StatefulWidget {
 
 class _ExcelPageState extends State<ExcelPage> {
   final List<PlatformFile> _files = [];
-  final TextEditingController _headerController = TextEditingController(text: '1');
-  final TextEditingController _footerController = TextEditingController(text: '0');
+  final TextEditingController _headerController = TextEditingController(
+    text: '1',
+  );
+  final TextEditingController _footerController = TextEditingController(
+    text: '0',
+  );
   final TextEditingController _cellRangeController = TextEditingController();
+  final TextEditingController _splitKeyController = TextEditingController(
+    text: 'A',
+  );
+  final TextEditingController _fieldOrderController = TextEditingController();
+  final TextEditingController _aliasRulesController = TextEditingController();
   ExcelMode _mode = ExcelMode.mergeWorkbooks;
   ExcelDirection _direction = ExcelDirection.vertical;
   InternalMergeMode _internalMode = InternalMergeMode.newSheetFirst;
   SameNameMode _sameNameMode = SameNameMode.rename;
+  SplitWorksheetOutputMode _splitWorksheetOutputMode =
+      SplitWorksheetOutputMode.oneWorkbook;
   int _headerRows = 1;
   int _footerRows = 0;
   String _cellRange = '';
+  String _splitKey = 'A';
+  String _fieldOrder = '';
+  String _aliasRules = '';
 
   bool _isRunning = false;
   double _progress = 0;
@@ -45,6 +129,9 @@ class _ExcelPageState extends State<ExcelPage> {
     _headerController.dispose();
     _footerController.dispose();
     _cellRangeController.dispose();
+    _splitKeyController.dispose();
+    _fieldOrderController.dispose();
+    _aliasRulesController.dispose();
     super.dispose();
   }
 
@@ -80,8 +167,12 @@ class _ExcelPageState extends State<ExcelPage> {
 
   bool get _needsHeaderFooter {
     return _mode == ExcelMode.mergeToSheet ||
+        _mode == ExcelMode.mergeToSheetSummary ||
         _mode == ExcelMode.internalMerge ||
+        _mode == ExcelMode.internalSummary ||
         _mode == ExcelMode.sameNameSheet ||
+        _mode == ExcelMode.sameNameSheetSummary ||
+        _mode == ExcelMode.splitWorksheet ||
         (_mode == ExcelMode.samePosition && _cellRange.trim().isEmpty);
   }
 
@@ -98,11 +189,13 @@ class _ExcelPageState extends State<ExcelPage> {
     final job = ExcelJob(
       mode: _mode,
       files: _files
-          .map((file) => ExcelInputFile(
-                name: file.name,
-                path: file.path!,
-                size: file.size,
-              ))
+          .map(
+            (file) => ExcelInputFile(
+              name: file.name,
+              path: file.path!,
+              size: file.size,
+            ),
+          )
           .toList(),
       headerRows: _headerRows,
       footerRows: _footerRows,
@@ -110,6 +203,10 @@ class _ExcelPageState extends State<ExcelPage> {
       internalMode: _internalMode,
       sameNameMode: _sameNameMode,
       cellRange: _cellRange,
+      splitKey: _splitKey,
+      fieldOrder: _fieldOrder,
+      aliasRules: _aliasRules,
+      splitWorksheetOutputMode: _splitWorksheetOutputMode,
       preview: preview,
     );
 
@@ -127,18 +224,23 @@ class _ExcelPageState extends State<ExcelPage> {
       _lastResult = null;
     });
 
-    final result = await taskService.runTask<ExcelJobResult>(handle, (context) async {
-      final res = await runner.run(job, onProgress: (progress) {
-        final total = max(1, progress.total);
-        final value = progress.completed / total;
-        context.updateProgress(value, message: progress.message);
-        if (mounted) {
-          setState(() {
-            _progress = value;
-            _status = progress.message;
-          });
-        }
-      });
+    final result = await taskService.runTask<ExcelJobResult>(handle, (
+      context,
+    ) async {
+      final res = await runner.run(
+        job,
+        onProgress: (progress) {
+          final total = max(1, progress.total);
+          final value = progress.completed / total;
+          context.updateProgress(value, message: progress.message);
+          if (mounted) {
+            setState(() {
+              _progress = value;
+              _status = progress.message;
+            });
+          }
+        },
+      );
       return res;
     });
 
@@ -250,7 +352,8 @@ class _ExcelPageState extends State<ExcelPage> {
                 ? const Center(child: Text('空表'))
                 : SingleChildScrollView(
                     child: Table(
-                      defaultVerticalAlignment: TableCellVerticalAlignment.middle,
+                      defaultVerticalAlignment:
+                          TableCellVerticalAlignment.middle,
                       border: TableBorder.all(color: Colors.black12),
                       children: rows
                           .map(
@@ -259,7 +362,9 @@ class _ExcelPageState extends State<ExcelPage> {
                                 maxCols,
                                 (index) => Padding(
                                   padding: const EdgeInsets.all(6),
-                                  child: Text(index < row.length ? row[index] : ''),
+                                  child: Text(
+                                    index < row.length ? row[index] : '',
+                                  ),
                                 ),
                               ),
                             ),
@@ -281,9 +386,9 @@ class _ExcelPageState extends State<ExcelPage> {
 
   void _showSnack(String message) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message)),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   @override
@@ -372,6 +477,8 @@ class _ExcelPageState extends State<ExcelPage> {
               ),
               const SizedBox(height: 16),
               _buildOptions(),
+              const SizedBox(height: 8),
+              _buildModeGuide(),
               const SizedBox(height: 12),
               if (_isRunning) ...[
                 LinearProgressIndicator(value: _progress),
@@ -383,7 +490,9 @@ class _ExcelPageState extends State<ExcelPage> {
                 spacing: 8,
                 children: [
                   OutlinedButton.icon(
-                    onPressed: (_lastResult?.outputs.isNotEmpty ?? false) ? _exportCsv : null,
+                    onPressed: (_lastResult?.outputs.isNotEmpty ?? false)
+                        ? _exportCsv
+                        : null,
                     icon: const Icon(Icons.table_view),
                     label: const Text('导出 CSV'),
                   ),
@@ -405,24 +514,40 @@ class _ExcelPageState extends State<ExcelPage> {
           label: '排列方向',
           value: _direction,
           items: const [
-            DropdownMenuItem(value: ExcelDirection.vertical, child: Text('竖向叠加')),
-            DropdownMenuItem(value: ExcelDirection.horizontal, child: Text('横向并列')),
+            DropdownMenuItem(
+              value: ExcelDirection.vertical,
+              child: Text('竖向叠加'),
+            ),
+            DropdownMenuItem(
+              value: ExcelDirection.horizontal,
+              child: Text('横向并列'),
+            ),
           ],
-          onChanged: (value) => setState(() => _direction = value ?? ExcelDirection.vertical),
+          onChanged: (value) =>
+              setState(() => _direction = value ?? ExcelDirection.vertical),
         ),
       );
     }
 
-    if (_mode == ExcelMode.internalMerge) {
+    if (_mode == ExcelMode.internalMerge ||
+        _mode == ExcelMode.internalSummary) {
       widgets.add(
         _buildEnumDropdown<InternalMergeMode>(
           label: '汇总方式',
           value: _internalMode,
           items: const [
-            DropdownMenuItem(value: InternalMergeMode.newSheetFirst, child: Text('新建汇总表(最前)')),
-            DropdownMenuItem(value: InternalMergeMode.firstSheet, child: Text('合并到第1个工作表')),
+            DropdownMenuItem(
+              value: InternalMergeMode.newSheetFirst,
+              child: Text('新建汇总表(最前)'),
+            ),
+            DropdownMenuItem(
+              value: InternalMergeMode.firstSheet,
+              child: Text('合并到第1个工作表'),
+            ),
           ],
-          onChanged: (value) => setState(() => _internalMode = value ?? InternalMergeMode.newSheetFirst),
+          onChanged: (value) => setState(
+            () => _internalMode = value ?? InternalMergeMode.newSheetFirst,
+          ),
         ),
       );
     }
@@ -436,12 +561,14 @@ class _ExcelPageState extends State<ExcelPage> {
             DropdownMenuItem(value: SameNameMode.rename, child: Text('自动重命名')),
             DropdownMenuItem(value: SameNameMode.skip, child: Text('跳过重复')),
           ],
-          onChanged: (value) => setState(() => _sameNameMode = value ?? SameNameMode.rename),
+          onChanged: (value) =>
+              setState(() => _sameNameMode = value ?? SameNameMode.rename),
         ),
       );
     }
 
-    if (_mode == ExcelMode.samePosition) {
+    if (_mode == ExcelMode.samePosition ||
+        _mode == ExcelMode.samePositionSummary) {
       widgets.add(
         TextField(
           controller: _cellRangeController,
@@ -450,6 +577,68 @@ class _ExcelPageState extends State<ExcelPage> {
             hintText: '为空则合并首个工作表',
           ),
           onChanged: (value) => setState(() => _cellRange = value),
+        ),
+      );
+    }
+
+    if (_mode == ExcelMode.splitWorksheet) {
+      widgets.add(
+        TextField(
+          controller: _splitKeyController,
+          decoration: const InputDecoration(
+            labelText: '拆分字段 (列名或列字母)',
+            hintText: '如: 水果名 或 A',
+          ),
+          onChanged: (value) => setState(() => _splitKey = value.trim()),
+        ),
+      );
+      widgets.add(
+        _buildEnumDropdown<SplitWorksheetOutputMode>(
+          label: '输出方式',
+          value: _splitWorksheetOutputMode,
+          items: const [
+            DropdownMenuItem(
+              value: SplitWorksheetOutputMode.oneWorkbook,
+              child: Text('输出到一个文件'),
+            ),
+            DropdownMenuItem(
+              value: SplitWorksheetOutputMode.separateFiles,
+              child: Text('输出到多个文件'),
+            ),
+            DropdownMenuItem(
+              value: SplitWorksheetOutputMode.both,
+              child: Text('两种都输出'),
+            ),
+          ],
+          onChanged: (value) => setState(
+            () => _splitWorksheetOutputMode =
+                value ?? SplitWorksheetOutputMode.oneWorkbook,
+          ),
+        ),
+      );
+    }
+
+    if (_mode == ExcelMode.reorderColumns || _mode == ExcelMode.mergeDynamic) {
+      widgets.add(
+        TextField(
+          controller: _fieldOrderController,
+          decoration: const InputDecoration(
+            labelText: '目标字段顺序 (逗号分隔)',
+            hintText: '如: 品名,价格,数量,厂家,备注',
+          ),
+          onChanged: (value) => setState(() => _fieldOrder = value.trim()),
+        ),
+      );
+      widgets.add(
+        TextField(
+          controller: _aliasRulesController,
+          minLines: 2,
+          maxLines: 4,
+          decoration: const InputDecoration(
+            labelText: '字段别名映射 (可选)',
+            hintText: '每行一条，格式: 原字段=目标字段',
+          ),
+          onChanged: (value) => setState(() => _aliasRules = value.trim()),
         ),
       );
     }
@@ -463,7 +652,8 @@ class _ExcelPageState extends State<ExcelPage> {
                 controller: _headerController,
                 decoration: const InputDecoration(labelText: '保留表头行数'),
                 keyboardType: TextInputType.number,
-                onChanged: (value) => setState(() => _headerRows = int.tryParse(value) ?? 0),
+                onChanged: (value) =>
+                    setState(() => _headerRows = int.tryParse(value) ?? 0),
               ),
             ),
             const SizedBox(width: 12),
@@ -472,7 +662,8 @@ class _ExcelPageState extends State<ExcelPage> {
                 controller: _footerController,
                 decoration: const InputDecoration(labelText: '去除表尾行数'),
                 keyboardType: TextInputType.number,
-                onChanged: (value) => setState(() => _footerRows = int.tryParse(value) ?? 0),
+                onChanged: (value) =>
+                    setState(() => _footerRows = int.tryParse(value) ?? 0),
               ),
             ),
           ],
@@ -494,6 +685,45 @@ class _ExcelPageState extends State<ExcelPage> {
             ),
           )
           .toList(),
+    );
+  }
+
+  Widget _buildModeGuide() {
+    final guide = _excelModeGuides[_mode];
+    if (guide == null) {
+      return const SizedBox.shrink();
+    }
+    final theme = Theme.of(context);
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.18),
+        border: Border.all(color: theme.dividerColor),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '功能说明',
+            style: theme.textTheme.titleSmall?.copyWith(
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(guide.description),
+          const SizedBox(height: 8),
+          Text(
+            '简单演示',
+            style: theme.textTheme.titleSmall?.copyWith(
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(guide.demo),
+        ],
+      ),
     );
   }
 
