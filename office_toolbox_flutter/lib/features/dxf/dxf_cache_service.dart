@@ -34,15 +34,96 @@ class DxfCacheService {
 
   final LogService _log;
   sqlite.Database? _db;
+  String? _dbPath;
 
-  Future<sqlite.Database> _openDb() async {
-    if (_db != null) return _db!;
-    final dir = await getApplicationSupportDirectory();
-    final dbPath = p.join(dir.path, 'office_toolbox_dxf.db');
-    final db = sqlite.sqlite3.open(dbPath);
+  String? get activeDbPath => _dbPath;
+
+  Future<sqlite.Database> _openDbForSources(List<PlatformFile> sources) async {
+    final resolvedPath = await _resolveDbPathForSources(sources);
+    if (_db != null && _dbPath == resolvedPath) {
+      return _db!;
+    }
+    _db?.dispose();
+    final parentDir = Directory(p.dirname(resolvedPath));
+    if (!parentDir.existsSync()) {
+      parentDir.createSync(recursive: true);
+    }
+    final db = sqlite.sqlite3.open(resolvedPath);
     _initSchema(db);
     _db = db;
+    _dbPath = resolvedPath;
     return db;
+  }
+
+  Future<sqlite.Database> _openCurrentDb() async {
+    if (_db != null) {
+      return _db!;
+    }
+    return _openDbForSources(const <PlatformFile>[]);
+  }
+
+  Future<String> _resolveDbPathForSources(List<PlatformFile> sources) async {
+    final sourcePaths = sources
+        .map((file) => file.path)
+        .whereType<String>()
+        .toList();
+    if (sourcePaths.isEmpty) {
+      final dir = await getApplicationSupportDirectory();
+      return p.join(dir.path, 'office_toolbox_dxf.db');
+    }
+
+    final parentDirs =
+        sourcePaths.map((path) => p.dirname(path)).toSet().toList()
+          ..sort((a, b) => a.compareTo(b));
+    final commonRoot = _findCommonPath(parentDirs);
+    if (commonRoot != null) {
+      final outputDir = p.join(commonRoot, 'output');
+      final outputFolder = Directory(outputDir);
+      if (!outputFolder.existsSync()) {
+        outputFolder.createSync(recursive: true);
+      }
+      await _hideOutputDir(outputDir);
+      return p.join(outputDir, 'dxf_index.sqlite');
+    }
+
+    final dir = await getApplicationSupportDirectory();
+    final key = md5
+        .convert(
+          parentDirs.map((item) => item.toLowerCase()).join('|').codeUnits,
+        )
+        .toString()
+        .substring(0, 12);
+    return p.join(dir.path, 'office_toolbox_dxf_$key.db');
+  }
+
+  String? _findCommonPath(List<String> paths) {
+    if (paths.isEmpty) {
+      return null;
+    }
+    if (paths.length == 1) {
+      return paths.first;
+    }
+
+    final parts = paths
+        .map((path) => p.normalize(path).split(RegExp(r'[\\/]')))
+        .toList();
+    final minLength = parts
+        .map((item) => item.length)
+        .reduce((a, b) => a < b ? a : b);
+    final common = <String>[];
+    for (var i = 0; i < minLength; i++) {
+      final token = parts.first[i].toLowerCase();
+      final same = parts.every((item) => item[i].toLowerCase() == token);
+      if (!same) {
+        break;
+      }
+      common.add(parts.first[i]);
+    }
+
+    if (common.length <= 1) {
+      return null;
+    }
+    return p.joinAll(common);
   }
 
   void _initSchema(sqlite.Database db) {
@@ -71,13 +152,18 @@ CREATE TABLE IF NOT EXISTS dxf_text (
   content_lower TEXT
 );
 ''');
-    db.execute('CREATE INDEX IF NOT EXISTS idx_dxf_text_source ON dxf_text(source_path);');
-    db.execute('CREATE INDEX IF NOT EXISTS idx_dxf_text_content ON dxf_text(content_lower);');
+    db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_dxf_text_source ON dxf_text(source_path);',
+    );
+    db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_dxf_text_content ON dxf_text(content_lower);',
+    );
   }
 
   Future<void> close() async {
     _db?.dispose();
     _db = null;
+    _dbPath = null;
   }
 
   Future<List<DxfPreparedFile>> prepareSources(
@@ -86,11 +172,12 @@ CREATE TABLE IF NOT EXISTS dxf_text (
     void Function(double progress, String message)? onProgress,
     bool pruneMissing = false,
   }) async {
-    final db = await _openDb();
     final validSources = sources.where((file) => file.path != null).toList();
+    final db = await _openDbForSources(validSources);
     if (pruneMissing) {
       final sourcePaths = validSources.map((file) => file.path!).toList();
-      _pruneMissingSources(db, sourcePaths);
+      await _pruneMissingSources(db, sourcePaths);
+      await _syncOutputFolders(validSources);
     }
 
     final prepared = <DxfPreparedFile>[];
@@ -152,9 +239,11 @@ CREATE TABLE IF NOT EXISTS dxf_text (
   }
 
   Future<List<DxfSearchResult>> queryKeywords(List<String> keywords) async {
-    final db = await _openDb();
+    final db = await _openCurrentDb();
     if (keywords.isEmpty) {
-      final rows = db.select('SELECT file_name, object_type, layer, content FROM dxf_text');
+      final rows = db.select(
+        'SELECT file_name, object_type, layer, content FROM dxf_text',
+      );
       return rows
           .map(
             (row) => DxfSearchResult(
@@ -168,10 +257,16 @@ CREATE TABLE IF NOT EXISTS dxf_text (
           .toList();
     }
 
-    final lowerKeywords = keywords.map((k) => k.toLowerCase()).where((k) => k.isNotEmpty).toList();
+    final lowerKeywords = keywords
+        .map((k) => k.toLowerCase())
+        .where((k) => k.isNotEmpty)
+        .toList();
     if (lowerKeywords.isEmpty) return [];
 
-    final clauses = List.filled(lowerKeywords.length, 'content_lower LIKE ?').join(' OR ');
+    final clauses = List.filled(
+      lowerKeywords.length,
+      'content_lower LIKE ?',
+    ).join(' OR ');
     final params = lowerKeywords.map((k) => '%$k%').toList();
     final rows = db.select(
       'SELECT file_name, object_type, layer, content, content_lower FROM dxf_text WHERE $clauses',
@@ -199,15 +294,115 @@ CREATE TABLE IF NOT EXISTS dxf_text (
     return results;
   }
 
-  void _pruneMissingSources(sqlite.Database db, List<String> sourcePaths) {
+  Future<void> _pruneMissingSources(
+    sqlite.Database db,
+    List<String> sourcePaths,
+  ) async {
+    List<sqlite.Row> removedRows;
     if (sourcePaths.isEmpty) {
+      removedRows = db.select('SELECT source_path, dxf_path FROM file_meta');
       db.execute('DELETE FROM dxf_text');
       db.execute('DELETE FROM file_meta');
-      return;
+    } else {
+      final placeholders = List.filled(sourcePaths.length, '?').join(',');
+      removedRows = db.select(
+        'SELECT source_path, dxf_path FROM file_meta WHERE source_path NOT IN ($placeholders)',
+        sourcePaths,
+      );
+      db.execute(
+        'DELETE FROM dxf_text WHERE source_path NOT IN ($placeholders)',
+        sourcePaths,
+      );
+      db.execute(
+        'DELETE FROM file_meta WHERE source_path NOT IN ($placeholders)',
+        sourcePaths,
+      );
     }
-    final placeholders = List.filled(sourcePaths.length, '?').join(',');
-    db.execute('DELETE FROM dxf_text WHERE source_path NOT IN ($placeholders)', sourcePaths);
-    db.execute('DELETE FROM file_meta WHERE source_path NOT IN ($placeholders)', sourcePaths);
+
+    for (final row in removedRows) {
+      final sourcePath = row['source_path'] as String? ?? '';
+      final dxfPath = row['dxf_path'] as String? ?? '';
+      if (!_isGeneratedOutputDxf(sourcePath, dxfPath)) {
+        continue;
+      }
+      final file = File(dxfPath);
+      if (!file.existsSync()) {
+        continue;
+      }
+      try {
+        file.deleteSync();
+        await _log.info('删除失效 DXF 缓存: $dxfPath', context: 'dxf');
+      } catch (error) {
+        await _log.warn(
+          '删除失效 DXF 缓存失败: $dxfPath',
+          context: 'dxf',
+          error: error,
+        );
+      }
+    }
+  }
+
+  bool _isGeneratedOutputDxf(String sourcePath, String dxfPath) {
+    if (sourcePath.isEmpty || dxfPath.isEmpty) {
+      return false;
+    }
+    if (sourcePath == dxfPath) {
+      return false;
+    }
+    if (p.extension(sourcePath).toLowerCase() != '.dwg') {
+      return false;
+    }
+    if (p.extension(dxfPath).toLowerCase() != '.dxf') {
+      return false;
+    }
+    return p.basename(p.dirname(dxfPath)).toLowerCase() == 'output';
+  }
+
+  Future<void> _syncOutputFolders(List<PlatformFile> sources) async {
+    final expectedBySourceDir = <String, Set<String>>{};
+    for (final source in sources) {
+      final sourcePath = source.path;
+      if (sourcePath == null) {
+        continue;
+      }
+      if (p.extension(sourcePath).toLowerCase() != '.dwg') {
+        continue;
+      }
+      final sourceDir = p.dirname(sourcePath);
+      expectedBySourceDir
+          .putIfAbsent(sourceDir, () => <String>{})
+          .add(p.basenameWithoutExtension(sourcePath).toLowerCase());
+    }
+
+    for (final entry in expectedBySourceDir.entries) {
+      final outputDir = Directory(p.join(entry.key, 'output'));
+      if (!outputDir.existsSync()) {
+        continue;
+      }
+      for (final entity in outputDir.listSync()) {
+        if (entity is! File) {
+          continue;
+        }
+        final dxfPath = entity.path;
+        if (p.extension(dxfPath).toLowerCase() != '.dxf') {
+          continue;
+        }
+        final baseName = p.basenameWithoutExtension(dxfPath).toLowerCase();
+        if (entry.value.contains(baseName)) {
+          continue;
+        }
+        try {
+          entity.deleteSync();
+          await _log.info('清理冗余 DXF 缓存: $dxfPath', context: 'dxf');
+        } catch (error) {
+          await _log.warn(
+            '清理冗余 DXF 缓存失败: $dxfPath',
+            context: 'dxf',
+            error: error,
+          );
+        }
+      }
+    }
   }
 
   Map<String, Object?>? _getMeta(sqlite.Database db, String sourcePath) {
@@ -245,7 +440,8 @@ CREATE TABLE IF NOT EXISTS dxf_text (
     final metaMtime = meta?['source_mtime'] as int?;
     final metaIndexedAt = meta?['indexed_at'] as int?;
 
-    var needsHash = meta == null || metaSize != sourceSize || metaMtime != sourceMtime;
+    var needsHash =
+        meta == null || metaSize != sourceSize || metaMtime != sourceMtime;
     if (needsHash) {
       sourceMd5 = await _computeFileMd5(sourcePath);
     }
@@ -260,12 +456,18 @@ CREATE TABLE IF NOT EXISTS dxf_text (
         outputFolder.createSync(recursive: true);
       }
       await _hideOutputDir(outputDir);
-      dxfPath = p.join(outputDir, '${p.basenameWithoutExtension(sourcePath)}.dxf');
+      dxfPath = p.join(
+        outputDir,
+        '${p.basenameWithoutExtension(sourcePath)}.dxf',
+      );
     }
 
     var dxfFile = File(dxfPath);
     if (!dxfFile.existsSync() && isDwg) {
-      final alt = _findDxfByBasename(p.dirname(dxfPath), p.basenameWithoutExtension(sourcePath));
+      final alt = _findDxfByBasename(
+        p.dirname(dxfPath),
+        p.basenameWithoutExtension(sourcePath),
+      );
       if (alt != null) {
         dxfPath = alt;
         dxfFile = File(dxfPath);
@@ -275,7 +477,10 @@ CREATE TABLE IF NOT EXISTS dxf_text (
     var needsConvert = false;
     if (isDwg) {
       final metaDxfPath = meta?['dxf_path'] as String?;
-      if (meta != null && metaSourceMd5 != null && metaSourceMd5 == sourceMd5 && metaDxfPath != null) {
+      if (meta != null &&
+          metaSourceMd5 != null &&
+          metaSourceMd5 == sourceMd5 &&
+          metaDxfPath != null) {
         final metaDxfFile = File(metaDxfPath);
         if (metaDxfFile.existsSync()) {
           dxfPath = metaDxfPath;
@@ -297,7 +502,10 @@ CREATE TABLE IF NOT EXISTS dxf_text (
         await _convertDwgToDxf(sourcePath, p.dirname(dxfPath));
         dxfFile = File(dxfPath);
         if (!dxfFile.existsSync()) {
-          final alt = _findDxfByBasename(p.dirname(dxfPath), p.basenameWithoutExtension(sourcePath));
+          final alt = _findDxfByBasename(
+            p.dirname(dxfPath),
+            p.basenameWithoutExtension(sourcePath),
+          );
           if (alt != null) {
             dxfPath = alt;
             dxfFile = File(dxfPath);
@@ -326,10 +534,22 @@ CREATE TABLE IF NOT EXISTS dxf_text (
       dxfMd5 = await _computeFileMd5(dxfPath);
     }
 
-    final sourceContentChanged = meta == null || metaSourceMd5 == null || sourceMd5 == null || metaSourceMd5 != sourceMd5;
-    final dxfContentChanged = meta == null || metaDxfMd5 == null || dxfMd5 == null || metaDxfMd5 != dxfMd5;
-    final needsIndex = meta == null || metaIndexedAt == null ||
-        sourceContentChanged || dxfContentChanged || needsConvert;
+    final sourceContentChanged =
+        meta == null ||
+        metaSourceMd5 == null ||
+        sourceMd5 == null ||
+        metaSourceMd5 != sourceMd5;
+    final dxfContentChanged =
+        meta == null ||
+        metaDxfMd5 == null ||
+        dxfMd5 == null ||
+        metaDxfMd5 != dxfMd5;
+    final needsIndex =
+        meta == null ||
+        metaIndexedAt == null ||
+        sourceContentChanged ||
+        dxfContentChanged ||
+        needsConvert;
 
     _upsertMeta(
       db,
@@ -403,7 +623,7 @@ CREATE TABLE IF NOT EXISTS dxf_text (
     void Function(double progress, String message)? onProgress,
   }) async {
     if (prepared.isEmpty) return;
-    final db = await _openDb();
+    final db = await _openCurrentDb();
     final needsIndex = prepared.where((file) => file.needsIndex).toList();
     if (needsIndex.isEmpty) return;
 
@@ -423,21 +643,29 @@ CREATE TABLE IF NOT EXISTS dxf_text (
       });
 
       if (response['ok'] != true && response['error'] != null) {
-        await _log.warn('解析失败: ${file.sourceName}', context: 'dxf', error: response['error']);
+        await _log.warn(
+          '解析失败: ${file.sourceName}',
+          context: 'dxf',
+          error: response['error'],
+        );
       }
 
       final items = (response['results'] as List)
-          .map((item) => {
-                'fileName': item['fileName'] as String? ?? file.sourceName,
-                'objectType': item['objectType'] as String? ?? '',
-                'layer': item['layer'] as String? ?? '',
-                'content': item['content'] as String? ?? '',
-              })
+          .map(
+            (item) => {
+              'fileName': item['fileName'] as String? ?? file.sourceName,
+              'objectType': item['objectType'] as String? ?? '',
+              'layer': item['layer'] as String? ?? '',
+              'content': item['content'] as String? ?? '',
+            },
+          )
           .toList();
 
       db.execute('BEGIN');
       try {
-        db.execute('DELETE FROM dxf_text WHERE source_path = ?', [file.sourcePath]);
+        db.execute('DELETE FROM dxf_text WHERE source_path = ?', [
+          file.sourcePath,
+        ]);
         final stmt = db.prepare(
           'INSERT INTO dxf_text '
           '(source_path, file_name, object_type, layer, content, content_lower) '
@@ -464,7 +692,11 @@ CREATE TABLE IF NOT EXISTS dxf_text (
         db.execute('COMMIT');
       } catch (error) {
         db.execute('ROLLBACK');
-        await _log.error('写入索引失败: ${file.sourceName}', context: 'dxf', error: error);
+        await _log.error(
+          '写入索引失败: ${file.sourceName}',
+          context: 'dxf',
+          error: error,
+        );
       }
     }
     onProgress?.call(1, '索引更新完成');
@@ -486,40 +718,101 @@ CREATE TABLE IF NOT EXISTS dxf_text (
     }
     await _hideOutputDir(outputDir);
 
+    final inputDir = p.dirname(dwgPath);
     final args = [
-      dwgPath,
+      inputDir,
       outputDir,
-      'DWG',
-      'DXF2010',
-      '-quiet',
+      'ACAD2010',
+      'DXF',
+      '0',
+      '0',
+      p.basename(dwgPath),
     ];
 
-    final result = await Process.run(exe, args, runInShell: true);
+    final result = await _runOda(exe, args);
     if (result.exitCode != 0) {
       await _log.error(
         'ODA 转换失败: $dwgPath',
         context: 'dxf',
-        error: '${result.stderr}'.trim().isEmpty ? result.stdout : result.stderr,
+        error: '${result.stderr}'.trim().isEmpty
+            ? result.stdout
+            : result.stderr,
       );
       throw Exception('ODA 转换失败');
     }
   }
 
-  String? _resolveOdaExecutable() {
-    final exeName = Platform.isWindows ? 'ODAFileConverter.exe' : 'odafileconverter';
-    final envPath = Platform.environment['ODA_FILE_CONVERTER'];
-    if (envPath != null && envPath.isNotEmpty && File(envPath).existsSync()) {
-      return envPath;
+  Future<ProcessResult> _runOda(String exe, List<String> args) async {
+    if (!Platform.isWindows) {
+      return Process.run(exe, args, runInShell: false);
     }
-    final exeDir = File(Platform.resolvedExecutable).parent.path;
-    final candidates = <String>[
-      p.join(exeDir, 'ODAFileConverter', exeName),
-      p.join(Directory.current.path, 'ODAFileConverter', exeName),
-      p.normalize(p.join(Directory.current.path, '..', 'ODAFileConverter', exeName)),
-      p.join(Directory.current.path, exeName),
-    ];
-    for (final candidate in candidates) {
-      if (File(candidate).existsSync()) return candidate;
+    final command = _buildHiddenStartProcessCommand(exe, args);
+    return Process.run('powershell', [
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      command,
+    ], runInShell: false);
+  }
+
+  String _buildHiddenStartProcessCommand(String exe, List<String> args) {
+    String escape(String value) => value.replaceAll("'", "''");
+    final quotedArgs = args.map((arg) => "'${escape(arg)}'").join(', ');
+    final argList = quotedArgs.isEmpty ? '@()' : '@($quotedArgs)';
+    final filePath = "'${escape(exe)}'";
+    return '\$p = Start-Process -FilePath $filePath -ArgumentList $argList '
+        '-WindowStyle Hidden -Wait -PassThru; exit \$p.ExitCode';
+  }
+
+  String? _resolveOdaExecutable() {
+    final exeName = Platform.isWindows
+        ? 'ODAFileConverter.exe'
+        : 'odafileconverter';
+    final envPath = Platform.environment['ODA_FILE_CONVERTER'];
+    if (envPath != null && envPath.isNotEmpty) {
+      final envFile = File(envPath);
+      if (envFile.existsSync()) return envPath;
+      final envDir = Directory(envPath);
+      if (envDir.existsSync()) {
+        final candidate = p.join(envDir.path, exeName);
+        if (File(candidate).existsSync()) return candidate;
+      }
+    }
+
+    final startDirs = <String>{
+      File(Platform.resolvedExecutable).parent.path,
+      Directory.current.path,
+    };
+
+    for (final startDir in startDirs) {
+      final resolved = _searchOdaInAncestors(startDir, exeName);
+      if (resolved != null) return resolved;
+    }
+
+    final pathEnv = Platform.environment['PATH'];
+    if (pathEnv != null && pathEnv.isNotEmpty) {
+      for (final dir in pathEnv.split(';')) {
+        final trimmed = dir.trim();
+        if (trimmed.isEmpty) continue;
+        final candidate = p.join(trimmed, exeName);
+        if (File(candidate).existsSync()) return candidate;
+      }
+    }
+
+    return null;
+  }
+
+  String? _searchOdaInAncestors(String startDir, String exeName) {
+    var current = Directory(startDir);
+    while (true) {
+      final direct = p.join(current.path, exeName);
+      if (File(direct).existsSync()) return direct;
+      final bundled = p.join(current.path, 'ODAFileConverter', exeName);
+      if (File(bundled).existsSync()) return bundled;
+
+      final parent = current.parent;
+      if (parent.path == current.path) break;
+      current = parent;
     }
     return null;
   }
@@ -540,7 +833,8 @@ CREATE TABLE IF NOT EXISTS dxf_text (
     for (final entity in folder.listSync()) {
       if (entity is! File) continue;
       final name = p.basenameWithoutExtension(entity.path).toLowerCase();
-      if (name == lowerBase && p.extension(entity.path).toLowerCase() == '.dxf') {
+      if (name == lowerBase &&
+          p.extension(entity.path).toLowerCase() == '.dxf') {
         return entity.path;
       }
     }

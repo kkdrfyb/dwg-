@@ -7,6 +7,7 @@ import 'package:provider/provider.dart';
 
 import '../../core/export/export_utils.dart';
 import '../../core/task/task_service.dart';
+import '../../core/task/task_exceptions.dart';
 import '../../widgets/section_card.dart';
 import 'dxf_cache_service.dart';
 import 'dxf_file_helper.dart';
@@ -22,6 +23,7 @@ class DxfSearchTab extends StatefulWidget {
 class _DxfSearchTabState extends State<DxfSearchTab> {
   final TextEditingController _keywordsController = TextEditingController();
   final ScrollController _fileScrollController = ScrollController();
+  final ScrollController _resultScrollController = ScrollController();
   final List<PlatformFile> _files = [];
   final List<DxfSearchResult> _results = [];
 
@@ -38,12 +40,11 @@ class _DxfSearchTabState extends State<DxfSearchTab> {
   String _filterKeyword = '';
   String _filterContent = '';
 
-  int _rowsPerPage = PaginatedDataTable.defaultRowsPerPage;
-
   @override
   void dispose() {
     _keywordsController.dispose();
     _fileScrollController.dispose();
+    _resultScrollController.dispose();
     super.dispose();
   }
 
@@ -115,8 +116,17 @@ class _DxfSearchTabState extends State<DxfSearchTab> {
     setState(() {
       _files.clear();
       _results.clear();
+      _clearFilters();
     });
     _scheduleIndex();
+  }
+
+  void _clearFilters() {
+    _filterFile = '';
+    _filterType = '';
+    _filterLayer = '';
+    _filterKeyword = '';
+    _filterContent = '';
   }
 
   void _scheduleIndex() {
@@ -196,10 +206,13 @@ class _DxfSearchTabState extends State<DxfSearchTab> {
       _progress = 0;
       _status = '准备查询...';
       _results.clear();
+      _clearFilters();
       _activeTaskId = handle.id;
     });
 
-    final results = await taskService.runTask<List<DxfSearchResult>>(handle, (taskContext) async {
+    final results = await taskService.runTask<List<DxfSearchResult>>(handle, (
+      taskContext,
+    ) async {
       await cache.ensureIndex(
         _files,
         taskContext,
@@ -211,7 +224,9 @@ class _DxfSearchTabState extends State<DxfSearchTab> {
           });
         },
       );
-      if (taskContext.isCanceled()) return null;
+      if (taskContext.isCanceled()) {
+        throw TaskCanceled();
+      }
       final data = await cache.queryKeywords(keywords);
       return data;
     });
@@ -232,7 +247,9 @@ class _DxfSearchTabState extends State<DxfSearchTab> {
         ..addAll(results);
       _isRunning = false;
       _progress = 1;
-      _status = results.isEmpty ? '查询完成，未找到匹配内容' : '查询完成，找到 ${results.length} 条结果';
+      _status = results.isEmpty
+          ? '查询完成，未找到匹配内容'
+          : '查询完成，找到 ${results.length} 条结果';
     });
   }
 
@@ -269,17 +286,19 @@ class _DxfSearchTabState extends State<DxfSearchTab> {
 
   void _showSnack(String message) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message)),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   List<DxfSearchResult> get _filteredResults {
     return _results.where((item) {
       if (_filterFile.isNotEmpty && item.fileName != _filterFile) return false;
-      if (_filterType.isNotEmpty && item.objectType != _filterType) return false;
+      if (_filterType.isNotEmpty && item.objectType != _filterType)
+        return false;
       if (_filterLayer.isNotEmpty && item.layer != _filterLayer) return false;
-      if (_filterKeyword.isNotEmpty && item.keyword != _filterKeyword) return false;
+      if (_filterKeyword.isNotEmpty && item.keyword != _filterKeyword)
+        return false;
       if (_filterContent.isNotEmpty &&
           !item.content.toLowerCase().contains(_filterContent.toLowerCase())) {
         return false;
@@ -302,6 +321,7 @@ class _DxfSearchTabState extends State<DxfSearchTab> {
     final layers = _unique(_results.map((e) => e.layer).toList());
     final keywords = _unique(_results.map((e) => e.keyword).toList());
     final theme = Theme.of(context);
+    final dbPath = context.read<DxfCacheService>().activeDbPath;
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -335,7 +355,9 @@ class _DxfSearchTabState extends State<DxfSearchTab> {
                     onDragExited: (_) => setState(() => _isDragging = false),
                     onDragDone: (detail) async {
                       setState(() => _isDragging = false);
-                      await _handleDrop(detail.files.map((file) => file.path).toList());
+                      await _handleDrop(
+                        detail.files.map((file) => file.path).toList(),
+                      );
                     },
                     child: Container(
                       width: double.infinity,
@@ -369,8 +391,10 @@ class _DxfSearchTabState extends State<DxfSearchTab> {
                                 icon: const Icon(Icons.folder_open),
                                 label: const Text('选择文件夹'),
                               ),
-                              Text('支持拖拽文件或文件夹到此区域',
-                                  style: theme.textTheme.bodySmall),
+                              Text(
+                                '支持拖拽文件或文件夹到此区域',
+                                style: theme.textTheme.bodySmall,
+                              ),
                             ],
                           ),
                         ],
@@ -392,7 +416,9 @@ class _DxfSearchTabState extends State<DxfSearchTab> {
                           children: [
                             Text(
                               '已上传文件 (${_files.length})',
-                              style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w600),
+                              style: theme.textTheme.titleSmall?.copyWith(
+                                fontWeight: FontWeight.w600,
+                              ),
                             ),
                             const Spacer(),
                             TextButton.icon(
@@ -407,7 +433,10 @@ class _DxfSearchTabState extends State<DxfSearchTab> {
                           height: 180,
                           child: _files.isEmpty
                               ? Center(
-                                  child: Text('暂无文件', style: theme.textTheme.bodySmall),
+                                  child: Text(
+                                    '暂无文件',
+                                    style: theme.textTheme.bodySmall,
+                                  ),
                                 )
                               : Scrollbar(
                                   controller: _fileScrollController,
@@ -415,15 +444,23 @@ class _DxfSearchTabState extends State<DxfSearchTab> {
                                   child: ListView.separated(
                                     controller: _fileScrollController,
                                     itemCount: _files.length,
-                                    separatorBuilder: (_, __) => const Divider(height: 1),
+                                    separatorBuilder: (_, __) =>
+                                        const Divider(height: 1),
                                     itemBuilder: (context, index) {
                                       final file = _files[index];
                                       final path = file.path ?? '';
                                       return ListTile(
                                         dense: true,
                                         visualDensity: VisualDensity.compact,
-                                        leading: const Icon(Icons.description_outlined, size: 20),
-                                        title: Text(file.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+                                        leading: const Icon(
+                                          Icons.description_outlined,
+                                          size: 20,
+                                        ),
+                                        title: Text(
+                                          file.name,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
                                         subtitle: path.isEmpty
                                             ? null
                                             : Text(
@@ -458,6 +495,13 @@ class _DxfSearchTabState extends State<DxfSearchTab> {
                     const SizedBox(height: 8),
                   ],
                   if (_status.isNotEmpty) Text(_status),
+                  if (dbPath != null && dbPath.isNotEmpty) ...[
+                    const SizedBox(height: 4),
+                    SelectableText(
+                      '索引数据库: $dbPath',
+                      style: theme.textTheme.bodySmall,
+                    ),
+                  ],
                   const SizedBox(height: 12),
                   Wrap(
                     spacing: 8,
@@ -489,16 +533,31 @@ class _DxfSearchTabState extends State<DxfSearchTab> {
                       runSpacing: 12,
                       children: [
                         _buildDropdown('文件', files, _filterFile, (value) {
-                          setState(() => _filterFile = value == '全部' ? '' : value ?? '');
+                          setState(
+                            () =>
+                                _filterFile = value == '全部' ? '' : value ?? '',
+                          );
                         }),
                         _buildDropdown('类型', types, _filterType, (value) {
-                          setState(() => _filterType = value == '全部' ? '' : value ?? '');
+                          setState(
+                            () =>
+                                _filterType = value == '全部' ? '' : value ?? '',
+                          );
                         }),
                         _buildDropdown('图层', layers, _filterLayer, (value) {
-                          setState(() => _filterLayer = value == '全部' ? '' : value ?? '');
+                          setState(
+                            () =>
+                                _filterLayer = value == '全部' ? '' : value ?? '',
+                          );
                         }),
-                        _buildDropdown('关键字', keywords, _filterKeyword, (value) {
-                          setState(() => _filterKeyword = value == '全部' ? '' : value ?? '');
+                        _buildDropdown('关键字', keywords, _filterKeyword, (
+                          value,
+                        ) {
+                          setState(
+                            () => _filterKeyword = value == '全部'
+                                ? ''
+                                : value ?? '',
+                          );
                         }),
                         SizedBox(
                           width: 220,
@@ -506,18 +565,13 @@ class _DxfSearchTabState extends State<DxfSearchTab> {
                             decoration: const InputDecoration(
                               labelText: '匹配内容过滤',
                             ),
-                            onChanged: (value) => setState(() => _filterContent = value.trim()),
+                            onChanged: (value) =>
+                                setState(() => _filterContent = value.trim()),
                           ),
                         ),
                         OutlinedButton.icon(
                           onPressed: () {
-                            setState(() {
-                              _filterFile = '';
-                              _filterType = '';
-                              _filterLayer = '';
-                              _filterKeyword = '';
-                              _filterContent = '';
-                            });
+                            setState(_clearFilters);
                           },
                           icon: const Icon(Icons.filter_alt_off),
                           label: const Text('清除筛选'),
@@ -527,24 +581,59 @@ class _DxfSearchTabState extends State<DxfSearchTab> {
                     const SizedBox(height: 12),
                     SizedBox(
                       height: tableHeight,
-                      child: SingleChildScrollView(
-                        scrollDirection: Axis.horizontal,
-                        child: PaginatedDataTable(
-                          header: Text('匹配结果 (${filtered.length})'),
-                          rowsPerPage: _rowsPerPage,
-                          onRowsPerPageChanged: (value) {
-                            if (value == null) return;
-                            setState(() => _rowsPerPage = value);
-                          },
-                          columns: const [
-                            DataColumn(label: Text('文件名')),
-                            DataColumn(label: Text('对象类型')),
-                            DataColumn(label: Text('图层')),
-                            DataColumn(label: Text('关键字')),
-                            DataColumn(label: Text('匹配内容')),
-                          ],
-                          source: _SearchDataSource(filtered),
-                        ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 8),
+                            child: Text(
+                              '匹配结果 (${filtered.length}/${_results.length})',
+                            ),
+                          ),
+                          Expanded(
+                            child: Scrollbar(
+                              controller: _resultScrollController,
+                              thumbVisibility: true,
+                              child: SingleChildScrollView(
+                                controller: _resultScrollController,
+                                child: SingleChildScrollView(
+                                  scrollDirection: Axis.horizontal,
+                                  child: DataTable(
+                                    headingRowHeight: 42,
+                                    dataRowMinHeight: 44,
+                                    dataRowMaxHeight: 64,
+                                    columns: const [
+                                      DataColumn(label: Text('文件名')),
+                                      DataColumn(label: Text('对象类型')),
+                                      DataColumn(label: Text('图层')),
+                                      DataColumn(label: Text('关键字')),
+                                      DataColumn(label: Text('匹配内容')),
+                                    ],
+                                    rows: filtered
+                                        .map(
+                                          (row) => DataRow(
+                                            cells: [
+                                              DataCell(Text(row.fileName)),
+                                              DataCell(Text(row.objectType)),
+                                              DataCell(
+                                                Text(
+                                                  row.layer.isEmpty
+                                                      ? '-'
+                                                      : row.layer,
+                                                ),
+                                              ),
+                                              DataCell(Text(row.keyword)),
+                                              DataCell(Text(row.content)),
+                                            ],
+                                          ),
+                                        )
+                                        .toList(),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
                       ),
                     ),
                   ],
@@ -572,12 +661,7 @@ class _DxfSearchTabState extends State<DxfSearchTab> {
             value: value.isEmpty ? '全部' : value,
             isDense: true,
             items: items
-                .map(
-                  (item) => DropdownMenuItem(
-                    value: item,
-                    child: Text(item),
-                  ),
-                )
+                .map((item) => DropdownMenuItem(value: item, child: Text(item)))
                 .toList(),
             onChanged: onChanged,
           ),
@@ -585,35 +669,4 @@ class _DxfSearchTabState extends State<DxfSearchTab> {
       ),
     );
   }
-}
-
-class _SearchDataSource extends DataTableSource {
-  _SearchDataSource(this.rows);
-
-  final List<DxfSearchResult> rows;
-
-  @override
-  DataRow? getRow(int index) {
-    if (index >= rows.length) return null;
-    final row = rows[index];
-    return DataRow.byIndex(
-      index: index,
-      cells: [
-        DataCell(Text(row.fileName)),
-        DataCell(Text(row.objectType)),
-        DataCell(Text(row.layer.isEmpty ? '-' : row.layer)),
-        DataCell(Text(row.keyword)),
-        DataCell(Text(row.content)),
-      ],
-    );
-  }
-
-  @override
-  bool get isRowCountApproximate => false;
-
-  @override
-  int get rowCount => rows.length;
-
-  @override
-  int get selectedRowCount => 0;
 }
