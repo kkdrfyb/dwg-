@@ -55,6 +55,8 @@ class ExcelJob {
     this.splitKey = '',
     this.fieldOrder = '',
     this.aliasRules = '',
+    this.fileFieldOrders = const <String, String>{},
+    this.fileAliasRules = const <String, String>{},
     this.splitWorksheetOutputMode = SplitWorksheetOutputMode.oneWorkbook,
     this.preview = false,
   });
@@ -70,6 +72,8 @@ class ExcelJob {
   final String splitKey;
   final String fieldOrder;
   final String aliasRules;
+  final Map<String, String> fileFieldOrders;
+  final Map<String, String> fileAliasRules;
   final SplitWorksheetOutputMode splitWorksheetOutputMode;
   final bool preview;
 
@@ -85,6 +89,8 @@ class ExcelJob {
     'splitKey': splitKey,
     'fieldOrder': fieldOrder,
     'aliasRules': aliasRules,
+    'fileFieldOrders': fileFieldOrders,
+    'fileAliasRules': fileAliasRules,
     'splitWorksheetOutputMode': splitWorksheetOutputMode.name,
     'preview': preview,
   };
@@ -109,6 +115,12 @@ class ExcelJob {
       splitKey: map['splitKey'] as String? ?? '',
       fieldOrder: map['fieldOrder'] as String? ?? '',
       aliasRules: map['aliasRules'] as String? ?? '',
+      fileFieldOrders: Map<String, String>.from(
+        map['fileFieldOrders'] as Map? ?? const {},
+      ),
+      fileAliasRules: Map<String, String>.from(
+        map['fileAliasRules'] as Map? ?? const {},
+      ),
       splitWorksheetOutputMode: SplitWorksheetOutputMode.values.byName(
         map['splitWorksheetOutputMode'] as String? ??
             SplitWorksheetOutputMode.oneWorkbook.name,
@@ -196,11 +208,11 @@ extension ExcelModeLabel on ExcelMode {
   String get label {
     switch (this) {
       case ExcelMode.mergeWorkbooks:
-        return '多工作簿 -> 工作簿';
+        return '多工作簿提取到一簿';
       case ExcelMode.mergeToSheet:
-        return '多工作簿 -> 工作表';
+        return '多工作簿提取到一表';
       case ExcelMode.internalMerge:
-        return '工作簿内部汇总';
+        return '一簿提取到一表';
       case ExcelMode.reorderColumns:
         return '调整字段名的列号';
       case ExcelMode.splitWorkbook:

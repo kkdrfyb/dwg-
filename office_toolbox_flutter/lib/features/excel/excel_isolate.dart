@@ -268,6 +268,7 @@ ExcelJobResult _processJob(
         final aggregated = _aggregateRecords(
           allRows,
           explicitHeaderOrder: headers.toList(),
+          detailHeaderSameAsValue: true,
         );
         final excel = createWorkbookWithSheet('Result');
         final sheet = excel['Result'];
@@ -330,14 +331,16 @@ ExcelJobResult _processJob(
       }
     case ExcelMode.reorderColumns:
       {
-        final preferredOrder = _parseFieldOrder(job.fieldOrder);
-        final aliasMap = _parseAliasRules(job.aliasRules);
         final usedFiles = <String>{};
         for (var i = 0; i < job.files.length; i++) {
           checkCanceled();
           final file = job.files[i];
           onProgress(i + 1, job.files.length, '调整列序: ${file.name}');
           final source = readExcel(file);
+          final fileOrder = job.fileFieldOrders[file.path] ?? job.fieldOrder;
+          final fileAlias = job.fileAliasRules[file.path] ?? job.aliasRules;
+          final preferredOrder = _parseFieldOrder(fileOrder);
+          final aliasMap = _parseAliasRules(fileAlias);
           final out = _reorderWorkbookColumns(
             source,
             preferredOrder: preferredOrder,
@@ -385,19 +388,23 @@ ExcelJobResult _processJob(
       }
     case ExcelMode.splitWorksheet:
       {
+        final headerCount = job.headerRows <= 0 ? 1 : job.headerRows;
+        final footerCount = job.footerRows < 0 ? 0 : job.footerRows;
         final allRows = <Map<String, String>>[];
         final headerOrder = <String>[];
         final headerSeen = <String>{};
+        _SplitSheetRecords? templateRecords;
+
         for (var i = 0; i < job.files.length; i++) {
           checkCanceled();
           final file = job.files[i];
           onProgress(i + 1, job.files.length, '读取: ${file.name}');
           final wb = readExcel(file);
           for (final source in wb.sheets.values) {
-            final parsed = _sheetToRecords(
+            final parsed = _sheetToSplitRecords(
               source,
-              headerRows: job.headerRows,
-              footerRows: job.footerRows,
+              headerRows: headerCount,
+              footerRows: footerCount,
             );
             if (parsed == null) {
               continue;
@@ -408,8 +415,10 @@ ExcelJobResult _processJob(
               }
             }
             allRows.addAll(parsed.rows);
+            templateRecords ??= parsed;
           }
         }
+
         if (allRows.isEmpty) {
           final empty = createWorkbookWithSheet('Result');
           empty['Result']
@@ -434,14 +443,21 @@ ExcelJobResult _processJob(
                 SplitWorksheetOutputMode.oneWorkbook ||
             job.splitWorksheetOutputMode == SplitWorksheetOutputMode.both) {
           final out = createWorkbookWithSheet('Result(总表)');
-          _writeRows(out['Result(总表)'], _recordsToTable(allRows, headerOrder));
+          _writeSplitSheet(
+            out['Result(总表)'],
+            rows: allRows,
+            headerOrder: headerOrder,
+            template: templateRecords,
+          );
           final usedNames = <String>{'Result(总表)'};
           for (final entry in grouped.entries) {
             final sheetName = _uniqueSheetName(entry.key, usedNames);
             usedNames.add(sheetName);
-            _writeRows(
+            _writeSplitSheet(
               out[sheetName],
-              _recordsToTable(entry.value, headerOrder),
+              rows: entry.value,
+              headerOrder: headerOrder,
+              template: templateRecords,
             );
           }
           addOutput(out, '拆分结果.xlsx');
@@ -456,9 +472,11 @@ ExcelJobResult _processJob(
             checkCanceled();
             final sheetName = _sanitizeSheetName(entry.key);
             final out = createWorkbookWithSheet(sheetName);
-            _writeRows(
+            _writeSplitSheet(
               out[sheetName],
-              _recordsToTable(entry.value, headerOrder),
+              rows: entry.value,
+              headerOrder: headerOrder,
+              template: templateRecords,
             );
             final base = _sanitizeFileName('${entry.key}.xlsx');
             final filename = _uniqueFileName(base, usedFiles);
@@ -540,12 +558,26 @@ ExcelJobResult _processJob(
           final summaryRows = _aggregateRecords(
             allRows,
             explicitHeaderOrder: headers.toList(),
+            detailHeaderSameAsValue: true,
+            compactListHeaders: true,
           );
-          final summaryName = _uniqueSheetName('汇总表', wb.sheets.keys.toSet());
-          final summarySheet = wb[summaryName];
-          _writeRows(summarySheet, summaryRows);
-          addOutput(wb, '${_cleanFileName(file.name)}.xlsx');
-          lastWorkbook = wb;
+
+          final out = createWorkbookWithSheet('汇总表');
+          _writeRows(out['汇总表'], summaryRows);
+          final usedNames = <String>{'汇总表'};
+          for (final sheetName in wb.sheets.keys) {
+            final uniqueName = _uniqueSheetName(sheetName, usedNames);
+            usedNames.add(uniqueName);
+            final targetSheet = out[uniqueName];
+            _copySheet(
+              wb.sheets[sheetName]!,
+              targetSheet,
+              checkCanceled: checkCanceled,
+            );
+          }
+
+          addOutput(out, '${_cleanFileName(file.name)}.xlsx');
+          lastWorkbook = out;
         }
         break;
       }
@@ -1270,6 +1302,73 @@ int _detectHeaderRowIndex({
   return bestRow;
 }
 
+_SplitSheetRecords? _sheetToSplitRecords(
+  Sheet source, {
+  required int headerRows,
+  required int footerRows,
+}) {
+  if (source.maxRows == 0 || source.maxColumns == 0) {
+    return null;
+  }
+
+  final topCount = headerRows <= 0 ? 1 : headerRows;
+  final bottomCount = footerRows < 0 ? 0 : footerRows;
+  final headerRow = min(source.maxRows - 1, topCount - 1);
+  final endDataRow = source.maxRows - 1 - bottomCount;
+  if (endDataRow <= headerRow) {
+    return null;
+  }
+
+  String readCell(int row, int col) {
+    return source
+            .cell(CellIndex.indexByColumnRow(columnIndex: col, rowIndex: row))
+            .value
+            ?.toString()
+            .trim() ??
+        '';
+  }
+
+  final headers = <String>[];
+  final usedHeaders = <String, int>{};
+  for (var c = 0; c < source.maxColumns; c++) {
+    var header = readCell(headerRow, c);
+    if (header.isEmpty) {
+      header = '列${c + 1}';
+    }
+    final count = usedHeaders[header] ?? 0;
+    usedHeaders[header] = count + 1;
+    if (count > 0) {
+      header = '${header}_${count + 1}';
+    }
+    headers.add(header);
+  }
+
+  final rows = <Map<String, String>>[];
+  for (var r = headerRow + 1; r <= endDataRow; r++) {
+    final row = <String, String>{};
+    var hasValue = false;
+    for (var c = 0; c < headers.length; c++) {
+      final value = readCell(r, c);
+      if (value.isNotEmpty) {
+        hasValue = true;
+      }
+      row[headers[c]] = value;
+    }
+    if (hasValue) {
+      rows.add(row);
+    }
+  }
+
+  return _SplitSheetRecords(
+    source: source,
+    headers: headers,
+    rows: rows,
+    headerRow: headerRow,
+    footerStartRow: endDataRow + 1,
+    dataTemplateRow: headerRow + 1 <= endDataRow ? headerRow + 1 : null,
+  );
+}
+
 _SheetRecords? _sheetToRecords(
   Sheet source, {
   required int headerRows,
@@ -1279,13 +1378,9 @@ _SheetRecords? _sheetToRecords(
     return null;
   }
 
-  var headerRow = headerRows;
-  if (headerRow < 0) {
-    headerRow = 0;
-  }
-  if (headerRow >= source.maxRows) {
-    headerRow = source.maxRows - 1;
-  }
+  final topCount = headerRows <= 0 ? 1 : headerRows;
+  final bottomCount = footerRows < 0 ? 0 : footerRows;
+  var headerRow = min(source.maxRows - 1, topCount - 1);
 
   String readCell(int row, int col) {
     return source
@@ -1314,7 +1409,7 @@ _SheetRecords? _sheetToRecords(
     }
   }
 
-  final endRow = source.maxRows - 1 - footerRows;
+  final endRow = source.maxRows - 1 - bottomCount;
   if (endRow <= headerRow) {
     return null;
   }
@@ -1359,6 +1454,8 @@ _SheetRecords? _sheetToRecords(
 List<List<String>> _aggregateRecords(
   List<Map<String, String>> rows, {
   List<String>? explicitHeaderOrder,
+  bool detailHeaderSameAsValue = false,
+  bool compactListHeaders = false,
 }) {
   if (rows.isEmpty) {
     return const <List<String>>[];
@@ -1430,6 +1527,12 @@ List<List<String>> _aggregateRecords(
     }
   }
 
+  final selectedListHeaders = _selectAggregateListHeaders(
+    rows,
+    listHeaders,
+    compact: compactListHeaders,
+  );
+
   final groups = <String, _AggregateGroup>{};
   for (final row in rows) {
     final key = keyHeaders
@@ -1442,7 +1545,7 @@ List<List<String>> _aggregateRecords(
       ),
     );
 
-    for (final header in listHeaders) {
+    for (final header in selectedListHeaders) {
       final value = row[header]?.trim() ?? '';
       if (value.isNotEmpty) {
         group.listValues
@@ -1466,9 +1569,11 @@ List<List<String>> _aggregateRecords(
 
   final outHeader = <String>[
     ...keyHeaders,
-    ...listHeaders,
+    ...selectedListHeaders,
     ...sumHeaders,
-    ...sumHeaders.map((header) => '$header明细'),
+    ...sumHeaders.map(
+      (header) => detailHeaderSameAsValue ? header : '$header明细',
+    ),
   ];
 
   final table = <List<String>>[outHeader];
@@ -1477,7 +1582,7 @@ List<List<String>> _aggregateRecords(
     for (final header in keyHeaders) {
       row.add(group.keyValues[header] ?? '');
     }
-    for (final header in listHeaders) {
+    for (final header in selectedListHeaders) {
       final list = group.listValues[header];
       row.add(list == null ? '' : list.join(','));
     }
@@ -1502,6 +1607,60 @@ List<List<String>> _aggregateRecords(
   return table;
 }
 
+List<String> _selectAggregateListHeaders(
+  List<Map<String, String>> rows,
+  List<String> listHeaders, {
+  required bool compact,
+}) {
+  if (!compact || listHeaders.length <= 1) {
+    return listHeaders;
+  }
+
+  final compactCandidates = listHeaders
+      .where(
+        (header) =>
+            !header.contains('月') &&
+            !header.contains('日期') &&
+            !header.toLowerCase().contains('date'),
+      )
+      .toList();
+  final candidates = compactCandidates.isNotEmpty
+      ? compactCandidates
+      : listHeaders;
+  if (candidates.length <= 1) {
+    return candidates;
+  }
+
+  final semanticPreferred = candidates
+      .where((header) => RegExp(r'(级|分类|类别|类型|规格|型号|状态)').hasMatch(header))
+      .toList();
+  if (semanticPreferred.isNotEmpty) {
+    return semanticPreferred;
+  }
+
+  String best = candidates.first;
+  var bestScore = _aggregateCardinalityScore(rows, best);
+  for (final header in candidates.skip(1)) {
+    final score = _aggregateCardinalityScore(rows, header);
+    if (score < bestScore) {
+      best = header;
+      bestScore = score;
+    }
+  }
+  return <String>[best];
+}
+
+int _aggregateCardinalityScore(List<Map<String, String>> rows, String header) {
+  final values = rows
+      .map((row) => row[header]?.trim() ?? '')
+      .where((value) => value.isNotEmpty)
+      .toSet();
+  if (values.isEmpty) {
+    return 1 << 20;
+  }
+  return values.length;
+}
+
 _PositionAggregate _aggregatePositionValues(List<String> values) {
   final clean = values
       .map((value) => value.trim())
@@ -1524,7 +1683,10 @@ _PositionAggregate _aggregatePositionValues(List<String> values) {
 }
 
 double? _tryParseNumber(String text) {
-  final clean = text.replaceAll(',', '').trim();
+  final clean = _normalizeNumericLiteral(text);
+  if (clean == null) {
+    return null;
+  }
   if (!RegExp(r'^-?\d+(\.\d+)?$').hasMatch(clean)) {
     return null;
   }
@@ -1554,6 +1716,19 @@ List<List<String>> _recordsToTable(
     );
   }
   return table;
+}
+
+List<List<String>> _recordsToDataRows(
+  List<Map<String, String>> rows,
+  List<String> headerOrder,
+) {
+  return rows
+      .map(
+        (row) => headerOrder
+            .map((header) => row[header]?.toString().trim() ?? '')
+            .toList(),
+      )
+      .toList();
 }
 
 String _resolveSplitHeader(List<String> headers, String splitKey) {
@@ -1742,6 +1917,156 @@ void _copySheet(
   }
 }
 
+final Border _defaultGridBorder = Border(
+  borderStyle: BorderStyle.Thin,
+  borderColorHex: ExcelColor.black26,
+);
+
+final CellStyle _defaultGridCellStyle = CellStyle(
+  leftBorder: _defaultGridBorder,
+  rightBorder: _defaultGridBorder,
+  topBorder: _defaultGridBorder,
+  bottomBorder: _defaultGridBorder,
+);
+
+void _writeSplitSheet(
+  Sheet sheet, {
+  required List<Map<String, String>> rows,
+  required List<String> headerOrder,
+  required _SplitSheetRecords? template,
+}) {
+  final dataRows = _recordsToDataRows(rows, headerOrder);
+  if (template == null) {
+    _writeRows(sheet, <List<String>>[headerOrder, ...dataRows]);
+    return;
+  }
+
+  final source = template.source;
+  final headerRow = template.headerRow;
+
+  _copySheetRange(
+    source,
+    target: sheet,
+    sourceStartRow: 0,
+    sourceEndRow: headerRow,
+    targetStartRow: 0,
+    copyColumnWidths: true,
+  );
+
+  final headerStyles = _readRowStyles(source, headerRow, headerOrder.length);
+  _writeRow(sheet, headerRow, headerOrder, rowStyles: headerStyles);
+
+  final dataStyleRow = template.dataTemplateRow;
+  final dataStyles = dataStyleRow == null
+      ? null
+      : _readRowStyles(source, dataStyleRow, headerOrder.length);
+  final templateRowHeight = dataStyleRow == null
+      ? null
+      : source.getRowHeights[dataStyleRow];
+
+  var targetDataStartRow = headerRow + 1;
+  for (final row in dataRows) {
+    if (templateRowHeight != null) {
+      sheet.setRowHeight(targetDataStartRow, templateRowHeight);
+    }
+    _writeRow(sheet, targetDataStartRow, row, rowStyles: dataStyles);
+    targetDataStartRow++;
+  }
+
+  if (template.footerStartRow < source.maxRows) {
+    _copySheetRange(
+      source,
+      target: sheet,
+      sourceStartRow: template.footerStartRow,
+      sourceEndRow: source.maxRows - 1,
+      targetStartRow: targetDataStartRow,
+    );
+  }
+}
+
+void _copySheetRange(
+  Sheet source, {
+  required Sheet target,
+  required int sourceStartRow,
+  required int sourceEndRow,
+  required int targetStartRow,
+  bool copyColumnWidths = false,
+}) {
+  if (source.maxRows == 0 || source.maxColumns == 0) {
+    return;
+  }
+  if (sourceEndRow < sourceStartRow) {
+    return;
+  }
+
+  final maxCol = max(0, source.maxColumns - 1);
+  if (copyColumnWidths) {
+    source.getColumnWidths.forEach((col, width) {
+      target.setColumnWidth(col, width);
+    });
+  }
+
+  for (var sourceRow = sourceStartRow; sourceRow <= sourceEndRow; sourceRow++) {
+    final targetRow = targetStartRow + (sourceRow - sourceStartRow);
+    final row = source.row(sourceRow);
+
+    if (source.getRowHeights.containsKey(sourceRow)) {
+      target.setRowHeight(targetRow, source.getRowHeights[sourceRow]!);
+    }
+
+    for (var col = 0; col <= maxCol; col++) {
+      final data = col < row.length ? row[col] : null;
+      if (data == null) {
+        continue;
+      }
+      final cell = target.cell(
+        CellIndex.indexByColumnRow(columnIndex: col, rowIndex: targetRow),
+      );
+      cell.value = data.value;
+      if (data.cellStyle != null) {
+        cell.cellStyle = data.cellStyle;
+      }
+    }
+  }
+
+  if (source.spannedItems.isEmpty) {
+    return;
+  }
+
+  for (final span in source.spannedItems) {
+    final range = _parseSpan(span);
+    if (range == null) {
+      continue;
+    }
+    if (range.start.rowIndex < sourceStartRow ||
+        range.end.rowIndex > sourceEndRow) {
+      continue;
+    }
+    final targetStart = CellIndex.indexByColumnRow(
+      columnIndex: range.start.columnIndex,
+      rowIndex: targetStartRow + (range.start.rowIndex - sourceStartRow),
+    );
+    final targetEnd = CellIndex.indexByColumnRow(
+      columnIndex: range.end.columnIndex,
+      rowIndex: targetStartRow + (range.end.rowIndex - sourceStartRow),
+    );
+    target.merge(targetStart, targetEnd);
+  }
+}
+
+List<CellStyle?> _readRowStyles(Sheet source, int rowIndex, int width) {
+  final styles = List<CellStyle?>.filled(width, null);
+  if (rowIndex < 0 || rowIndex >= source.maxRows) {
+    return styles;
+  }
+  final row = source.row(rowIndex);
+  for (var c = 0; c < width; c++) {
+    final data = c < row.length ? row[c] : null;
+    styles[c] = data?.cellStyle;
+  }
+  return styles;
+}
+
 void _writeRows(Sheet sheet, List<List<String>> rows, {CellStyle? linkStyle}) {
   for (var r = 0; r < rows.length; r++) {
     _writeRow(sheet, r, rows[r]);
@@ -1758,14 +2083,87 @@ void _writeRows(Sheet sheet, List<List<String>> rows, {CellStyle? linkStyle}) {
   }
 }
 
-void _writeRow(Sheet sheet, int rowIndex, List<String> values) {
+void _writeRow(
+  Sheet sheet,
+  int rowIndex,
+  List<String> values, {
+  List<CellStyle?>? rowStyles,
+}) {
   for (var c = 0; c < values.length; c++) {
-    sheet
-        .cell(CellIndex.indexByColumnRow(columnIndex: c, rowIndex: rowIndex))
-        .value = TextCellValue(
-      values[c],
+    final cell = sheet.cell(
+      CellIndex.indexByColumnRow(columnIndex: c, rowIndex: rowIndex),
     );
+    final preferredStyle = rowStyles != null && c < rowStyles.length
+        ? rowStyles[c]
+        : null;
+    _setCellValueFromString(cell, values[c], preferredStyle: preferredStyle);
   }
+}
+
+void _setCellValueFromString(
+  Data cell,
+  String raw, {
+  CellStyle? preferredStyle,
+}) {
+  cell.value = _inferCellValue(raw);
+  cell.cellStyle = preferredStyle ?? _defaultGridCellStyle;
+}
+
+CellValue _inferCellValue(String raw) {
+  final text = raw.trim();
+  if (text.isEmpty) {
+    return TextCellValue('');
+  }
+
+  final lower = text.toLowerCase();
+  if (lower == 'true') {
+    return BoolCellValue(true);
+  }
+  if (lower == 'false') {
+    return BoolCellValue(false);
+  }
+
+  final normalized = _normalizeNumericLiteral(text);
+  if (normalized != null && _isNumericLiteral(normalized)) {
+    final intValue = int.tryParse(normalized);
+    if (intValue != null) {
+      return IntCellValue(intValue);
+    }
+    final doubleValue = double.tryParse(normalized);
+    if (doubleValue != null) {
+      return DoubleCellValue(doubleValue);
+    }
+  }
+
+  return TextCellValue(raw);
+}
+
+String? _normalizeNumericLiteral(String text) {
+  final input = text.trim();
+  if (input.isEmpty) {
+    return null;
+  }
+
+  if (input.contains(',')) {
+    if (!RegExp(r'^-?\d{1,3}(,\d{3})+(\.\d+)?$').hasMatch(input)) {
+      return null;
+    }
+    return input.replaceAll(',', '');
+  }
+
+  return input;
+}
+
+bool _isNumericLiteral(String text) {
+  if (!RegExp(r'^-?\d+(\.\d+)?$').hasMatch(text)) {
+    return false;
+  }
+  final unsigned = text.startsWith('-') ? text.substring(1) : text;
+  if (RegExp(r'^0\d+(\.\d+)?$').hasMatch(unsigned) &&
+      !unsigned.startsWith('0.')) {
+    return false;
+  }
+  return true;
 }
 
 List<int> _encodeExcel(Excel excel) {
@@ -1775,9 +2173,9 @@ List<int> _encodeExcel(Excel excel) {
 }
 
 CellStyle _linkStyle() {
-  return CellStyle(
-    fontColorHex: '0000FF'.excelColor,
-    underline: Underline.Single,
+  return _defaultGridCellStyle.copyWith(
+    fontColorHexVal: ExcelColor.blue,
+    underlineVal: Underline.Single,
   );
 }
 
@@ -1832,6 +2230,24 @@ class _MergeRange {
 
   final CellIndex start;
   final CellIndex end;
+}
+
+class _SplitSheetRecords {
+  _SplitSheetRecords({
+    required this.source,
+    required this.headers,
+    required this.rows,
+    required this.headerRow,
+    required this.footerStartRow,
+    required this.dataTemplateRow,
+  });
+
+  final Sheet source;
+  final List<String> headers;
+  final List<Map<String, String>> rows;
+  final int headerRow;
+  final int footerStartRow;
+  final int? dataTemplateRow;
 }
 
 class _SheetRecords {

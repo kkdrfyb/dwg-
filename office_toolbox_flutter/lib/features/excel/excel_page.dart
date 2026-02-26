@@ -20,9 +20,32 @@ class _ExcelModeGuide {
   final String demo;
 }
 
+class _ReorderSchemaGroup {
+  _ReorderSchemaGroup({
+    required this.signature,
+    required this.originalHeaders,
+    required this.files,
+  }) : editedHeaders = List<String>.from(originalHeaders);
+
+  final String signature;
+  final List<String> originalHeaders;
+  final List<PlatformFile> files;
+  final List<String> editedHeaders;
+}
+
+class _ReorderJobConfig {
+  const _ReorderJobConfig({
+    required this.fileFieldOrders,
+    required this.fileAliasRules,
+  });
+
+  final Map<String, String> fileFieldOrders;
+  final Map<String, String> fileAliasRules;
+}
+
 const Map<ExcelMode, _ExcelModeGuide> _excelModeGuides = {
   ExcelMode.mergeWorkbooks: _ExcelModeGuide(
-    description: '将多个文件的所有工作表复制到一个新工作簿，并生成索引表。',
+    description: '将多个文件的工作表提取到一个新工作簿，并生成索引表。',
     demo: '示例：门店A.xlsx + 门店B.xlsx -> 输出工作表：门店A-1月份、门店B-1月份...',
   ),
   ExcelMode.mergeToSheet: _ExcelModeGuide(
@@ -30,7 +53,7 @@ const Map<ExcelMode, _ExcelModeGuide> _excelModeGuides = {
     demo: '示例：两份月报纵向叠加为一张“汇总结果”表。',
   ),
   ExcelMode.internalMerge: _ExcelModeGuide(
-    description: '对每个工作簿内部多工作表执行提取合并。',
+    description: '对单个工作簿内多个工作表执行提取合并。',
     demo: '示例：门店A.xlsx 的 1月份+2月份 -> 全工作簿汇总。',
   ),
   ExcelMode.reorderColumns: _ExcelModeGuide(
@@ -56,10 +79,6 @@ const Map<ExcelMode, _ExcelModeGuide> _excelModeGuides = {
   ExcelMode.internalSummary: _ExcelModeGuide(
     description: '对单个工作簿内部多表做聚合汇总，生成“汇总表”。',
     demo: '示例：门店A.xlsx 的多月明细按品名汇总到一表。',
-  ),
-  ExcelMode.sameNameSheet: _ExcelModeGuide(
-    description: '跨文件按同名工作表执行提取合并。',
-    demo: '示例：所有文件的“1月份”提取到结果中的“1月份”表。',
   ),
   ExcelMode.sameNameSheetSummary: _ExcelModeGuide(
     description: '跨文件按同名工作表执行聚合汇总。',
@@ -117,6 +136,11 @@ class _ExcelPageState extends State<ExcelPage> {
   String _fieldOrder = '';
   String _aliasRules = '';
 
+  List<_ReorderSchemaGroup> _reorderGroups = const <_ReorderSchemaGroup>[];
+  int _activeReorderGroupIndex = 0;
+  bool _loadingReorderSchema = false;
+  String _reorderFingerprint = '';
+
   bool _isRunning = false;
   double _progress = 0;
   String _status = '';
@@ -148,14 +172,17 @@ class _ExcelPageState extends State<ExcelPage> {
         ..clear()
         ..addAll(result.files.where((file) => file.path != null));
     });
+    await _refreshReorderSchemasIfNeeded(force: true);
   }
 
-  void _removeFile(PlatformFile file) {
+  Future<void> _removeFile(PlatformFile file) async {
     setState(() => _files.remove(file));
+    await _refreshReorderSchemasIfNeeded(force: true);
   }
 
-  void _clearFiles() {
+  Future<void> _clearFiles() async {
     setState(() => _files.clear());
+    await _refreshReorderSchemasIfNeeded(force: true);
   }
 
   void _cancel() {
@@ -165,15 +192,303 @@ class _ExcelPageState extends State<ExcelPage> {
     _runner?.cancel();
   }
 
+  List<ExcelMode> get _visibleModes {
+    return ExcelMode.values
+        .where((mode) => mode != ExcelMode.sameNameSheet)
+        .toList(growable: false);
+  }
+
   bool get _needsHeaderFooter {
     return _mode == ExcelMode.mergeToSheet ||
         _mode == ExcelMode.mergeToSheetSummary ||
         _mode == ExcelMode.internalMerge ||
         _mode == ExcelMode.internalSummary ||
-        _mode == ExcelMode.sameNameSheet ||
         _mode == ExcelMode.sameNameSheetSummary ||
         _mode == ExcelMode.splitWorksheet ||
         (_mode == ExcelMode.samePosition && _cellRange.trim().isEmpty);
+  }
+
+  Future<void> _refreshReorderSchemasIfNeeded({bool force = false}) async {
+    if (_mode != ExcelMode.reorderColumns) {
+      if (_reorderGroups.isNotEmpty || _loadingReorderSchema) {
+        setState(() {
+          _reorderGroups = const <_ReorderSchemaGroup>[];
+          _activeReorderGroupIndex = 0;
+          _loadingReorderSchema = false;
+          _reorderFingerprint = '';
+        });
+      }
+      return;
+    }
+
+    final files = _files.where((file) => file.path != null).toList();
+    final fingerprint = files
+        .map((file) => '${file.path}|${file.size}')
+        .join('||');
+    if (!force &&
+        fingerprint == _reorderFingerprint &&
+        _reorderGroups.isNotEmpty) {
+      return;
+    }
+
+    if (files.isEmpty) {
+      setState(() {
+        _reorderGroups = const <_ReorderSchemaGroup>[];
+        _activeReorderGroupIndex = 0;
+        _loadingReorderSchema = false;
+        _reorderFingerprint = fingerprint;
+      });
+      return;
+    }
+
+    setState(() {
+      _loadingReorderSchema = true;
+    });
+
+    final grouped = <String, _ReorderSchemaGroup>{};
+    for (final file in files) {
+      final path = file.path;
+      if (path == null) {
+        continue;
+      }
+      final headers = await _readHeadersForFile(path);
+      if (headers.isEmpty) {
+        continue;
+      }
+      final signature = headers.join('').toLowerCase();
+      final existing = grouped[signature];
+      if (existing == null) {
+        grouped[signature] = _ReorderSchemaGroup(
+          signature: signature,
+          originalHeaders: headers,
+          files: <PlatformFile>[file],
+        );
+      } else {
+        existing.files.add(file);
+      }
+    }
+
+    if (!mounted) {
+      return;
+    }
+
+    final groups = grouped.values.toList()
+      ..sort((a, b) => b.files.length.compareTo(a.files.length));
+    setState(() {
+      _reorderGroups = groups;
+      if (_activeReorderGroupIndex >= groups.length) {
+        _activeReorderGroupIndex = 0;
+      }
+      _loadingReorderSchema = false;
+      _reorderFingerprint = fingerprint;
+    });
+  }
+
+  Future<List<String>> _readHeadersForFile(String path) async {
+    try {
+      final lower = path.toLowerCase();
+      if (lower.endsWith('.csv')) {
+        final text = await File(path).readAsString();
+        final lines = text
+            .split(RegExp(r'\r?\n'))
+            .where((line) => line.trim().isNotEmpty)
+            .toList();
+        if (lines.isEmpty) {
+          return const <String>[];
+        }
+        final headerRow = lines.first.split(',');
+        final headers = <String>[];
+        for (var i = 0; i < headerRow.length; i++) {
+          final value = headerRow[i].trim();
+          headers.add(value.isEmpty ? '列${i + 1}' : value);
+        }
+        return _dedupeHeaders(headers);
+      }
+
+      final bytes = await File(path).readAsBytes();
+      final excel = Excel.decodeBytes(bytes);
+      if (excel.sheets.isEmpty) {
+        return const <String>[];
+      }
+      final sheet = excel.sheets.values.first;
+      if (sheet.maxRows <= 0 || sheet.maxColumns <= 0) {
+        return const <String>[];
+      }
+      var headerRow = _headerRows <= 0 ? 0 : _headerRows - 1;
+      if (headerRow >= sheet.maxRows) {
+        headerRow = sheet.maxRows - 1;
+      }
+
+      bool hasValue(int row) {
+        for (var c = 0; c < sheet.maxColumns; c++) {
+          final value =
+              sheet
+                  .cell(
+                    CellIndex.indexByColumnRow(columnIndex: c, rowIndex: row),
+                  )
+                  .value
+                  ?.toString()
+                  .trim() ??
+              '';
+          if (value.isNotEmpty) {
+            return true;
+          }
+        }
+        return false;
+      }
+
+      if (!hasValue(headerRow)) {
+        for (var r = headerRow; r < sheet.maxRows; r++) {
+          if (hasValue(r)) {
+            headerRow = r;
+            break;
+          }
+        }
+      }
+
+      final headers = <String>[];
+      for (var c = 0; c < sheet.maxColumns; c++) {
+        final value =
+            sheet
+                .cell(
+                  CellIndex.indexByColumnRow(
+                    columnIndex: c,
+                    rowIndex: headerRow,
+                  ),
+                )
+                .value
+                ?.toString()
+                .trim() ??
+            '';
+        headers.add(value.isEmpty ? '列${c + 1}' : value);
+      }
+      return _dedupeHeaders(headers);
+    } catch (_) {
+      return const <String>[];
+    }
+  }
+
+  List<String> _dedupeHeaders(List<String> headers) {
+    final used = <String, int>{};
+    final result = <String>[];
+    for (var i = 0; i < headers.length; i++) {
+      final trimmed = headers[i].trim().isEmpty
+          ? '列${i + 1}'
+          : headers[i].trim();
+      final count = used[trimmed] ?? 0;
+      used[trimmed] = count + 1;
+      if (count == 0) {
+        result.add(trimmed);
+      } else {
+        result.add('${trimmed}_${count + 1}');
+      }
+    }
+    return result;
+  }
+
+  void _reorderHeadersInActiveGroup(int oldIndex, int newIndex) {
+    if (_activeReorderGroupIndex >= _reorderGroups.length) {
+      return;
+    }
+    setState(() {
+      final group = _reorderGroups[_activeReorderGroupIndex];
+      if (newIndex > oldIndex) {
+        newIndex -= 1;
+      }
+      final moved = group.editedHeaders.removeAt(oldIndex);
+      group.editedHeaders.insert(newIndex, moved);
+    });
+  }
+
+  Future<void> _renameHeaderInActiveGroup(int index) async {
+    if (_activeReorderGroupIndex >= _reorderGroups.length) {
+      return;
+    }
+    final group = _reorderGroups[_activeReorderGroupIndex];
+    if (index < 0 || index >= group.editedHeaders.length) {
+      return;
+    }
+    final controller = TextEditingController(text: group.editedHeaders[index]);
+    final newName = await showDialog<String>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('修改字段名'),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            decoration: const InputDecoration(labelText: '字段名'),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () =>
+                  Navigator.of(context).pop(controller.text.trim()),
+              child: const Text('确定'),
+            ),
+          ],
+        );
+      },
+    );
+    if (newName == null) {
+      return;
+    }
+    if (newName.trim().isEmpty) {
+      _showSnack('字段名不能为空');
+      return;
+    }
+    setState(() {
+      group.editedHeaders[index] = newName;
+    });
+  }
+
+  void _resetActiveReorderGroup() {
+    if (_activeReorderGroupIndex >= _reorderGroups.length) {
+      return;
+    }
+    setState(() {
+      final group = _reorderGroups[_activeReorderGroupIndex];
+      group.editedHeaders
+        ..clear()
+        ..addAll(group.originalHeaders);
+    });
+  }
+
+  _ReorderJobConfig _buildReorderJobConfig() {
+    final fileFieldOrders = <String, String>{};
+    final fileAliasRules = <String, String>{};
+    for (final group in _reorderGroups) {
+      final headers = _dedupeHeaders(group.editedHeaders);
+      final fieldOrder = headers.join(',');
+      final aliasLines = <String>[];
+      final total = min(group.originalHeaders.length, headers.length);
+      for (var i = 0; i < total; i++) {
+        final original = group.originalHeaders[i].trim();
+        final renamed = headers[i].trim();
+        if (original.isEmpty || renamed.isEmpty || original == renamed) {
+          continue;
+        }
+        aliasLines.add('$original=$renamed');
+      }
+      final aliasRules = aliasLines.join('\n');
+      for (final file in group.files) {
+        final path = file.path;
+        if (path == null) {
+          continue;
+        }
+        fileFieldOrders[path] = fieldOrder;
+        if (aliasRules.isNotEmpty) {
+          fileAliasRules[path] = aliasRules;
+        }
+      }
+    }
+    return _ReorderJobConfig(
+      fileFieldOrders: fileFieldOrders,
+      fileAliasRules: fileAliasRules,
+    );
   }
 
   Future<void> _runJob({required bool preview}) async {
@@ -184,6 +499,19 @@ class _ExcelPageState extends State<ExcelPage> {
     if (_files.any((file) => file.name.toLowerCase().endsWith('.xls'))) {
       _showSnack('暂不支持 .xls，请先转换为 .xlsx');
       return;
+    }
+
+    Map<String, String> fileFieldOrders = const <String, String>{};
+    Map<String, String> fileAliasRules = const <String, String>{};
+    if (_mode == ExcelMode.reorderColumns) {
+      await _refreshReorderSchemasIfNeeded(force: true);
+      if (_reorderGroups.isEmpty) {
+        _showSnack('未读取到可调整的字段名，请检查文件内容');
+        return;
+      }
+      final config = _buildReorderJobConfig();
+      fileFieldOrders = config.fileFieldOrders;
+      fileAliasRules = config.fileAliasRules;
     }
 
     final job = ExcelJob(
@@ -206,6 +534,8 @@ class _ExcelPageState extends State<ExcelPage> {
       splitKey: _splitKey,
       fieldOrder: _fieldOrder,
       aliasRules: _aliasRules,
+      fileFieldOrders: fileFieldOrders,
+      fileAliasRules: fileAliasRules,
       splitWorksheetOutputMode: _splitWorksheetOutputMode,
       preview: preview,
     );
@@ -434,7 +764,7 @@ class _ExcelPageState extends State<ExcelPage> {
                     label: const Text('选择文件'),
                   ),
                   OutlinedButton.icon(
-                    onPressed: _files.isEmpty ? null : _clearFiles,
+                    onPressed: _files.isEmpty ? null : () => _clearFiles(),
                     icon: const Icon(Icons.delete_outline),
                     label: const Text('清空列表'),
                   ),
@@ -462,7 +792,7 @@ class _ExcelPageState extends State<ExcelPage> {
               Wrap(
                 spacing: 8,
                 runSpacing: 8,
-                children: ExcelMode.values
+                children: _visibleModes
                     .map(
                       (mode) => ChoiceChip(
                         label: Text(mode.label),
@@ -470,6 +800,7 @@ class _ExcelPageState extends State<ExcelPage> {
                         onSelected: (selected) {
                           if (!selected) return;
                           setState(() => _mode = mode);
+                          _refreshReorderSchemasIfNeeded(force: true);
                         },
                       ),
                     )
@@ -618,7 +949,11 @@ class _ExcelPageState extends State<ExcelPage> {
       );
     }
 
-    if (_mode == ExcelMode.reorderColumns || _mode == ExcelMode.mergeDynamic) {
+    if (_mode == ExcelMode.reorderColumns) {
+      widgets.add(_buildReorderColumnsDesigner());
+    }
+
+    if (_mode == ExcelMode.mergeDynamic) {
       widgets.add(
         TextField(
           controller: _fieldOrderController,
@@ -652,8 +987,10 @@ class _ExcelPageState extends State<ExcelPage> {
                 controller: _headerController,
                 decoration: const InputDecoration(labelText: '保留表头行数'),
                 keyboardType: TextInputType.number,
-                onChanged: (value) =>
-                    setState(() => _headerRows = int.tryParse(value) ?? 0),
+                onChanged: (value) {
+                  setState(() => _headerRows = int.tryParse(value) ?? 0);
+                  _refreshReorderSchemasIfNeeded(force: true);
+                },
               ),
             ),
             const SizedBox(width: 12),
@@ -662,8 +999,9 @@ class _ExcelPageState extends State<ExcelPage> {
                 controller: _footerController,
                 decoration: const InputDecoration(labelText: '去除表尾行数'),
                 keyboardType: TextInputType.number,
-                onChanged: (value) =>
-                    setState(() => _footerRows = int.tryParse(value) ?? 0),
+                onChanged: (value) {
+                  setState(() => _footerRows = int.tryParse(value) ?? 0);
+                },
               ),
             ),
           ],
@@ -688,6 +1026,115 @@ class _ExcelPageState extends State<ExcelPage> {
     );
   }
 
+  Widget _buildReorderColumnsDesigner() {
+    final theme = Theme.of(context);
+    if (_loadingReorderSchema) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 8),
+        child: LinearProgressIndicator(),
+      );
+    }
+
+    if (_files.isEmpty) {
+      return const Text('请先选择文件后再调整字段顺序。');
+    }
+
+    if (_reorderGroups.isEmpty) {
+      return const Text('未识别到可调整字段，请确认文件首行包含字段名。');
+    }
+
+    final activeIndex = _activeReorderGroupIndex.clamp(
+      0,
+      _reorderGroups.length - 1,
+    );
+    final group = _reorderGroups[activeIndex];
+    final filesText = group.files.map((file) => file.name).join('、');
+    final listHeight = (group.editedHeaders.length * 52.0).clamp(160.0, 420.0);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (_reorderGroups.length > 1) ...[
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: List.generate(_reorderGroups.length, (index) {
+              final item = _reorderGroups[index];
+              return ChoiceChip(
+                label: Text('字段组 ${index + 1} (${item.files.length}个文件)'),
+                selected: activeIndex == index,
+                onSelected: (selected) {
+                  if (!selected) {
+                    return;
+                  }
+                  setState(() {
+                    _activeReorderGroupIndex = index;
+                  });
+                },
+              );
+            }),
+          ),
+          const SizedBox(height: 8),
+        ],
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(
+            color: theme.colorScheme.surfaceContainerHighest.withValues(
+              alpha: 0.15,
+            ),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: theme.dividerColor),
+          ),
+          child: Text('字段一致对应文件：$filesText'),
+        ),
+        const SizedBox(height: 10),
+        Container(
+          height: listHeight,
+          decoration: BoxDecoration(
+            border: Border.all(color: theme.dividerColor),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: ReorderableListView.builder(
+            buildDefaultDragHandles: false,
+            padding: const EdgeInsets.symmetric(vertical: 6),
+            itemCount: group.editedHeaders.length,
+            onReorder: _reorderHeadersInActiveGroup,
+            itemBuilder: (context, index) {
+              final header = group.editedHeaders[index];
+              return ListTile(
+                key: ValueKey('${group.signature}_${index}_$header'),
+                leading: ReorderableDragStartListener(
+                  index: index,
+                  child: const Icon(Icons.drag_indicator),
+                ),
+                title: Text(header),
+                subtitle: Text('字段 ${index + 1}'),
+                trailing: IconButton(
+                  tooltip: '修改字段名',
+                  onPressed: () => _renameHeaderInActiveGroup(index),
+                  icon: const Icon(Icons.edit_outlined),
+                ),
+              );
+            },
+          ),
+        ),
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 8,
+          children: [
+            OutlinedButton.icon(
+              onPressed: _resetActiveReorderGroup,
+              icon: const Icon(Icons.restore),
+              label: const Text('恢复原字段顺序'),
+            ),
+            Text('可拖拽调整顺序，也可逐项修改字段名。', style: theme.textTheme.bodySmall),
+          ],
+        ),
+      ],
+    );
+  }
+
   Widget _buildModeGuide() {
     final guide = _excelModeGuides[_mode];
     if (guide == null) {
@@ -698,7 +1145,9 @@ class _ExcelPageState extends State<ExcelPage> {
       width: double.infinity,
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.18),
+        color: theme.colorScheme.surfaceContainerHighest.withValues(
+          alpha: 0.18,
+        ),
         border: Border.all(color: theme.dividerColor),
         borderRadius: BorderRadius.circular(10),
       ),
